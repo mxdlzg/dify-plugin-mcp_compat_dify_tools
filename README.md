@@ -1,164 +1,154 @@
-## Dify 1.0 Plugin Convert your Dify tools's API to MCP compatible API
+# Dify Tool → MCP Gateway
 
-**Author:** [Junjie.M](https://github.com/junjiem)   
+将 Dify 平台的工具通过 MCP（Model Context Protocol）暴露给外部 Agent 使用。
+
+Expose **any Dify tool** — marketplace plugin tools, custom API tools, workflow tools — to
+external MCP clients such as **Claude Code, Codex, Cherry Studio, Cline** over
+**Streamable HTTP** or legacy **HTTP with SSE**, without building any Dify workflow.
+
+> **Note:** requires Dify **1.2.0+** and plugin daemon with Python 3.12 runner.
+> **注：** 需要 Dify **1.2.0** 及以上版本。
+
+**Author:** mxdlzg   
 **Type:** extension   
-**Github Repo:** [https://github.com/junjiem/dify-plugin-mcp_compat_dify_tools](https://github.com/junjiem/dify-plugin-mcp_compat_dify_tools)   
-**Github Issues:** [issues](https://github.com/junjiem/dify-plugin-mcp_compat_dify_tools/issues)  
+**Github Repo:** https://github.com/mxdlzg/dify-plugin-mcp_compat_dify_tools   
+**Github Issues:** https://github.com/mxdlzg/dify-plugin-mcp_compat_dify_tools/issues
 
-
-Reference to https://github.com/hjlarry/dify-plugin-mcp_server
-
+Based on the fork of [Junjie.M/mcp_compat_dify_tools](https://github.com/junjiem/dify-plugin-mcp_compat_dify_tools)
+(which references [hjlarry/dify-plugin-mcp_server](https://github.com/hjlarry/dify-plugin-mcp_server)),
+rewritten in the 0.2.x line into a general-purpose gateway: correct tool schemas, protected
+server configuration, real display metadata, and plugin-wide settings.
+本仓库为上述项目的深度重构分支（0.2.x），已从"格式转换"演化为通用的 Dify 工具 → MCP 网关。
 
 ---
 
+## Why this fork 为什么用这个分支
 
-### Description
+The upstream plugin advertised every tool with an **empty or wrong inputSchema**, because the
+Dify Endpoint tool selector only persists *values* (`parameters`/`settings`), never the
+parameter *declaration* (type / required / description). Clients therefore had no idea that
+Tavily needs `query`, and calls failed inside the tool.
+上游插件给所有工具生成空/错误的 inputSchema：Dify 端点的工具选择器只保存**值**，从不保存参数
+**声明**（类型/必填/描述），导致 MCP 客户端不知道该传什么参数，调用在工具内部报错。
 
-> **Note:** must be dify 1.2.0 and above.
+This fork resolves each tool's **real declaration** from the Dify Console API (read-only, never
+invokes the tool), and builds honest MCP tools on top of it.
+本分支通过 Dify Console API（只读、绝不触发工具执行）解析每个工具的**真实声明**，在其上构建
+可信的 MCP 工具定义。
 
-> **注:** 必须是 dify 1.2.0及以上版本。
+### Features 特性
 
-Convert your Dify tools's API to MCP compatible API (**Currently, two transports are supported: `HTTP with SSE` and `Streamable HTTP`**)
+- **Real schemas at `tools/list`** — `required`, types, `enum` options and LLM descriptions come
+  from the original tool declaration fetched from the Console API (per-provider cache, 300s).
+  A tool whose schema cannot be resolved is **hidden**, not advertised with a misleading empty
+  schema. `tools/list` 输出**真实 Schema**（必填/类型/枚举/描述），来自 Console API；解析失败的
+  工具不上架，而不是用空 Schema 误导客户端。
+- **Protected server configuration 服务端配置保护** — parameters pinned in the endpoint (or the
+  tool's credential/`form` fields) never appear in the schema and cannot be overridden by the
+  MCP client; pinned values are merged into every call with their original Dify types (a select
+  `"false"` stays the string `"false"`). 端点中固定的参数、凭据类 `form` 参数不出现在 Schema、
+  不可被客户端覆盖，调用时按原始类型自动合并。
+- **Display metadata 显示元数据** — MCP `title` plus `icons` (light/dark, official MCP ≥
+  2025-09-24) taken from Dify provider metadata (full URLs).
+- **Configure once 一次配置，处处继承** — the three console settings are auto-registered into
+  plugin storage on first use; new endpoints leave them empty and inherit automatically
+  (per-field override supported).
+- **Single core, two transports 统一核心** — Streamable HTTP (`/mcp`) and legacy SSE (`/sse` +
+  `/messages/`) share one dispatch/adapter/converter, behavior can never diverge.
+- **No secret leakage 不泄露凭据** — failed calls return MCP `isError: true` with a masked
+  message, full details stay in daemon logs; diagnostics only ever log field names and counts.
 
-将您的 Dify 工具的 API 转换为 MCP 兼容 API (**目前已支持 `HTTP with SSE` 和 `Streamable HTTP` 两种传输方式**)
+---
 
-> **Note:** This fork requires dify_plugin >= 0.10.2 (Python 3.12 runner) and fixes tool
-> parameter schema generation and configuration-parameter resolution for MCP clients.
-> See "v0.2.0 changes" below.
->
-> **注：** 本分支要求 dify_plugin >= 0.10.2（Python 3.12 runner），修复了 MCP 客户端看到的工具
-> 参数 Schema 生成问题和 Dify 配置参数解析问题，详见下文“v0.2.0 变更”。
+## Quick start 快速开始
 
-### v0.2.2 changes v0.2.2 变更
+### 1. Install the plugin 安装插件
 
-**Console API authentication corrected + slimmer MCP definitions Console API 鉴权方式修正 + MCP 定义瘦身**
+Install from GitHub (Plugin management → Install via GitHub →
+`https://github.com/mxdlzg/dify-plugin-mcp_compat_dify_tools`), or repackage as an offline
+bundle with [dify-plugin-repackaging](https://github.com/junjiem/dify-plugin-repackaging).
 
-The Console API schema fetch was verified against a live Dify instance: it requires
-`Authorization: Bearer <key>` plus an **`X-WORKSPACE-ID`** header (not `X-Api-Key`). A new
-endpoint setting `dify_workspace_id` (team ID, from workspace settings) is now **required**
-together with the base URL and API key; tools are not exposed until all three are set.
+If you see *plugin verification has been enabled … bad signature*, append
+`FORCE_VERIFYING_SIGNATURE=false` to Dify's `.env` and restart.
 
-实测确认：Console API 需要 `Authorization: Bearer <key>` 和 **`X-WORKSPACE-ID`** 头（而非
-`X-Api-Key`）。新增 Endpoint 配置项 `dify_workspace_id`（团队 ID，见「团队设置」），与地址、Key
-三者齐备才会暴露工具。
+### 2. Prepare the console access 准备 Console 访问凭据
 
-Fetched schemas are slimmed before caching and never passed through verbatim: each parameter
-keeps only `name/type/form/required/multiple/input_schema`, one `llm_description` string
-(prefer en_US; i18n objects are flattened) and `options[].value`. i18n labels,
-human_description, placeholder, min/max/default, author, labels etc. no longer reach the MCP
-client, so `tools/list` stays compact. 拉取的 Schema 在缓存前即瘦身：仅保留
-`name/type/form/required/multiple/input_schema`、单一 `llm_description` 字符串与
-`options[].value`；i18n 标签、human_description、placeholder、min/max、author 等一律不进入
-`tools/list`。
+Schema fetching reads (never invokes) two read-only Console API routes:
 
-Also: the temporary `MCP_SCHEMA_DIAG` diagnostic has been removed. 临时诊断代码已移除。
+```
+GET {base}/console/api/workspaces/current/tool-provider/builtin/{provider}/tools
+GET {base}/console/api/workspaces/current/tools/builtin        # provider title + icons
+```
 
-**Plugin-wide defaults, per-endpoint override 插件级默认值 + 端点级覆盖**
+They require `Authorization: Bearer <key>` and `X-WORKSPACE-ID`. Collect:
 
-The three console settings are now registered plugin-wide on first use: an endpoint that
-fills all three fields stores them in the plugin's persistence storage as the default; a new
-endpoint leaves them empty and inherits automatically (per-field — a value filled on the
-endpoint overrides only that field). A partially filled endpoint is never written back, so it
-cannot poison the default. Note: endpoint settings are encrypted at rest by the daemon, but
-the default copy lives in plugin storage (plain KV, reachable only by this plugin).
+| Setting 配置项 | Where to get it 从哪里获取 | Example 示例 |
+|---|---|---|
+| `dify_console_api_base` | Dify API address **reachable from the plugin container** 插件容器可访问的 API 地址 | `http://api:5001` (same compose network) or `http://host.docker.internal:5001` |
+| `dify_console_api_key` | Dify **Profile → API 设置** → create Secret key | `tvpm…` |
+| `dify_workspace_id` | **团队设置** (team ID, also visible in browser URL) | `c4ae3307-d5b5-…` |
 
-三个配置项支持"登记一次、处处继承"：任一 Endpoint 填全三项后自动写入插件存储作为默认值；新建
-Endpoint 留空即自动继承（按字段合并，端点自己填的字段优先覆盖）。只填一部分的端点不会被写回，
-避免污染默认值。注意：端点设置由 daemon 加密存储，而默认值副本存于插件 storage（明文 KV，仅本
-插件可读）。
+Only `scheme://host[:port]` goes into the base URL; a pasted full console URL is trimmed
+automatically. 地址只填 `协议://主机:端口`，粘贴完整 URL 会自动截取。
 
-### v0.2.1 changes v0.2.1 变更
+### 3. Create an endpoint 创建 API 端点
 
-**Tool Metadata Resolution Fix — required setup for tool schemas 工具元数据解析修复（获取工具 Schema 的必填配置）**
+Plugin → this plugin → **API Endpoint** → Add endpoint: pick the tools, and fill the three
+fields above **on the first endpoint only**. Later endpoints leave them empty and inherit.
+第一个端点填写三项配置；之后的端点留空即自动继承。
 
-Root cause discovered with Dify source evidence: the Dify endpoint tool selector
-(`getToolValue()` in `use-tool-selector.ts`) persists **values only** (`parameters` +
-`settings`, no type/required/description), and the Dify backend + plugin daemon forward
-endpoint settings verbatim — a tool parameter **schema never reaches this plugin through
-endpoint settings**. The plugin SDK and daemon provide no backwards-invocation to query
-another plugin's tool declaration.
+![add_endpoint](./_assets/add_endpoint.png)
+![add_tool_list](./_assets/add_tool_list.png)
+![save_endpoint](./_assets/save_endpoint.png)
 
-根因（有 Dify 源码证据）：Dify Endpoint 工具选择器只持久化**值**（`parameters`+`settings`，
-不含类型/必填/描述），后端与 daemon 对 settings 原样转发 —— 工具参数 **Schema 永远不会通过
-Endpoint 配置到达本插件**；SDK 与 daemon 也没有查询其他插件工具声明的反向调用通道。
+> **Note:** changes to an existing endpoint's tool list only take effect after the endpoint is
+> disabled and re-enabled. **And: reinstalling/upgrade of the plugin changes the endpoint ID —
+> always re-copy the URL afterwards.**
+> **注：** 修改已有端点的工具列表需停用再启用才生效。**重装/升级插件会更换端点 ID，务必重新复制
+> URL**（旧 URL 会返回 `endpoint not found`）。
 
-Fix 修复方式: at `tools/list`/`tools/call` the plugin now **reads** (never invokes) the
-original tool definition from the Dify Console API
-`GET /console/api/workspaces/current/tool-provider/builtin/{provider}/tools`
-(read-only, per-provider cache, `X-Api-Key` auth). Two new endpoint settings appear:
+### 4. Connect your MCP client 接入 MCP 客户端
 
-- `dify_console_api_base` — base URL of your Dify instance reachable **from the plugin
-  container**, e.g. `http://host.docker.internal:5001` (docker) or `http://api:5001`
-  (same compose network)
-- `dify_console_api_key` — `secret-input`, created in Dify **Settings → API**; the daemon
-  stores it encrypted. Used only for read-only schema fetches.
-- `dify_workspace_id` — team ID sent as `X-WORKSPACE-ID` (**added in 0.2.2, required**)
+**Streamable HTTP (recommended 推荐)**
 
-If these are not configured or a schema cannot be fetched, the tool is **not exposed**
-(logged with a reason) instead of being advertised with a misleading empty schema.
-Tools that truly have no parameters return an empty list from the Console API and are
-still exposed normally.
+```bash
+# Claude Code
+claude mcp add --transport http dify-tools http://<your-dify>/e/<endpoint-id>/mcp
+```
 
-未配置或拉取失败的工具将**不再暴露**（日志说明原因），而不是用误导性的空 Schema 上架；
-真正无参数的工具（Console API 返回空列表）照常暴露。
+![mcp_streamable_http_url](./_assets/mcp_streamable_http_url.png)
+![cherry_studio_mcp_streamable_http](./_assets/cherry_studio_mcp_streamable_http.png)
 
-Setup steps 配置步骤：
-1. Upgrade the plugin to 0.2.1, disable + re-enable the endpoint 升级插件后停用再启用端点
-2. Edit the endpoint: fill `dify_console_api_base` and create/paste a console API key
-   编辑端点：填 Console API 地址并创建/粘贴 API Key
-3. `tools/list` should now show real schemas (Tavily: required `query`) `tools/list`
-   将显示真实 Schema（Tavily 出现必填 `query`）
+**Legacy HTTP with SSE (deprecated but supported)**: point the client at
+`http://<your-dify>/e/<endpoint-id>/sse`.
+![mcp_sse_url](./_assets/mcp_sse_url.png)
 
-Also in 0.2.1 同期修复：settings double-wrapper unwrapping (real shape is
-`{value: {type: constant, value: X}}`), metadata-source selection no longer locked by an
-empty `schemas` key, `TOOL_META_DIAG` diagnostics, real version in `serverInfo`.
+A `tools/list` entry now looks like:
 
-### v0.2.0 changes v0.2.0 变更
+```json
+{
+  "name": "tavily_search",
+  "title": "Tavily Search",
+  "description": "A search engine tailored to LLM agents",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": {"type": "string", "description": "The search query."},
+      "search_depth": {"type": "string", "enum": ["basic", "advanced", "fast", "ultra-fast"],
+                       "description": "The depth of the search."}
+    },
+    "required": ["query"]
+  },
+  "icons": [
+    {"src": "http://…/f101df9e…svg", "theme": "light"},
+    {"src": "http://…/7be5cd10…svg", "theme": "dark"}
+  ]
+}
+```
 
-1. **MCP inputSchema is generated correctly.** Dify tool parameters are converted to valid
-   JSON Schema: `select` → `string` + `enum`, `number`/`boolean` map 1:1, `object`/`array`
-   keep nested metadata, `date` → `string(format: date)`. Illegal types such as `select` are
-   never emitted. A required parameter such as Tavily's `query` now always appears in
-   `properties` and `required` (previously an empty schema could be produced silently).
+---
 
-   **MCP inputSchema 正确生成。** Dify 参数被转换为合法 JSON Schema：`select` → `string`+`enum`，
-   `number`/`boolean` 一一对应，`object`/`array` 保留嵌套结构。此前 Tavily 必填参数 `query`
-   可能丢失、产生空 Schema 的问题已修复。
-
-2. **Dify configuration expressions are resolved.** Server-side tool configuration stored as
-   `{"type": "constant", "value": "false"}` (including nested wrapping) is unwrapped to the
-   real value before invoking the tool, keeping its original type (the string `"false"` stays
-   a string). `include_answer` no longer reaches tools as a raw expression object. Dynamic
-   expressions (`variable`/`mixed`) are rejected with a clear error instead of passed through.
-
-   **Dify 配置表达式被正确解析。** `{"type":"constant","value":...}`（含嵌套包装）在调用工具前
-   被解包为实际值且保持原类型；`variable`/`mixed` 动态表达式明确报错而不是透传。
-
-3. **Server-side configuration is protected.** Parameters pinned by the user in the Dify
-   endpoint (and any credential/`form` parameter) are hidden from `tools/list` and cannot be
-   overridden by the MCP client. The client may only send `llm` parameters that were not
-   pinned.
-
-   **服务端配置受保护。** 用户在 Dify Endpoint 中固定的参数以及凭据类 `form` 参数不会出现在
-   `tools/list` 中，MCP Client 也无法越权覆盖；Client 只能提交未被固定的 `llm` 参数。
-
-4. **Single shared core.** `endpoints/mcp_post.py` (Streamable HTTP) and `endpoints/messages.py`
-   (legacy SSE) now share `core/tool_adapter.py`, `core/schema_converter.py`,
-   `core/parameter_resolver.py` and `core/mcp_handler.py`, so both transports always behave
-   identically.
-
-   **统一核心逻辑。** Streamable HTTP 与旧版 SSE 两个 Endpoint 共用 `core/` 下的公共模块，
-   行为完全一致。
-
-5. **MCP-compliant error handling & no secret leakage.** Failed tool calls return MCP tool
-   results with `isError: true`; internal exception details (which may contain provider
-   credentials) stay in the plugin daemon logs only. The old debug print of the full tools
-   configuration has been removed.
-
-   **符合 MCP 语义的错误处理，不再泄露敏感数据。** 调用失败以 `isError: true` 的工具结果返回；
-   异常细节只写入插件日志，不回传客户端；已移除打印完整 tools 配置的调试语句。
-
-#### Supported parameter types 支持的参数类型
+## Parameter type mapping 参数类型映射
 
 | Dify type | MCP JSON Schema |
 |---|---|
@@ -171,10 +161,46 @@ empty `schemas` key, `TOOL_META_DIAG` diagnostics, real version in `serverInfo`.
 | date-range | `object {start, end}` |
 | object / array | `object` / `array`（有嵌套元数据时保留） |
 
-Not yet supported 暂不支持：`file`/`files` 参数（从 Schema 移除并在日志提示）、工具输出的
-图片/文件类消息（返回文字占位说明）、`variable`/`mixed` 动态配置表达式（调用时明确报错）。
+Advanced compatibility note: endpoint entries that inline a full `schemas` list or a
+`tool_parameters` map (SDK `ToolSelector` shape) are still honored — useful for fixtures.
+内联 `schemas` / `tool_parameters` 的旧数据结构仍然支持（高级用法）。
 
-#### Testing 本地测试
+---
+
+## Known limitations 已知限制
+
+- Schema auto-resolution targets **builtin/marketplace** tool providers (Console API
+  `builtin/` route). Custom **API / workflow / app** tools need an inline `schemas` fixture for
+  now, otherwise they are not exposed. 自动解析目前覆盖内置/市场插件工具；自定义 API/工作流工具
+  需要内联 `schemas`，否则不上架。
+- `file`/`files` parameters are dropped from schemas (logged); image/file tool outputs return a
+  text placeholder; `variable`/`mixed` dynamic config expressions are rejected at call time.
+  文件类参数、图片/文件输出、动态变量表达式暂不支持。
+- Endpoints have **no authentication / Origin validation** (inherited upstream): deploy on a
+  trusted network or put an authenticating reverse proxy in front. 端点无鉴权（沿袭上游），请部署
+  在可信网络或加反代鉴权。
+- The auto-registered default config lives in plugin storage (plain KV, readable only by this
+  plugin itself); the endpoint's own copy of the key stays daemon-encrypted.
+- Provider metadata is cached 300s per base+workspace; icon/label changes need up to 5 minutes.
+
+## FAQ
+
+**Q: `endpoint not found` when calling the URL?**
+Reinstalling or upgrading the plugin regenerates endpoint IDs — copy the URL again from the
+endpoint list. 插件重装/升级后端点 ID 会变，去端点列表重新复制 URL。
+
+**Q: Tools missing from `tools/list`?**
+Check plugin daemon logs for `TOOL_META_DIAG` / "not exposing" lines: usually the console
+access fields are unset (or the plugin container cannot reach `dify_console_api_base`), or the
+tool is not builtin and has no inline schema. 看 daemon 日志里的 `TOOL_META_DIAG`：多为三个配置
+项未填 / 容器访问不到 Console API 地址 / 非内置工具无内联 Schema。
+
+**Q: Plugin fails to install dependencies (uv 404 from a mirror)?**
+The mirror is serving a partial package index; restart the plugin daemon container (clears uv's
+negative cache) or set `UV_DEFAULT_INDEX=https://pypi.org/simple` on the daemon. 镜像源同步延迟，
+重启 plugin_daemon 容器，或给 daemon 配置 `UV_DEFAULT_INDEX`。
+
+## Development 本地开发
 
 ```bash
 # Python 3.12+ required (matches the plugin runner)
@@ -183,84 +209,19 @@ python -m venv .venv
 .venv/Scripts/python -m pytest tests -v
 ```
 
+`core/` holds the transport-independent logic (adapter, schema converter, parameter resolver,
+console metadata, global config); `endpoints/` are thin per-transport shells.
 
-#### 1. Add a endpoint and add tool list. 添加API端点并添加工具列表。
+## Changelog 变更记录（0.2.x）
 
-![add_endpoint](./_assets/add_endpoint.png)
-
-![add_tool_list](./_assets/add_tool_list.png)
-
-![edit_tool](./_assets/edit_tool.png)
-
-![save_endpoint](./_assets/save_endpoint.png)
-
-> **Note:** The modification of the tool list for existing endpoint will take effect only after the endpoint are disabled and then enabled.
-
-> **注：** 对已有 API 端点进行工具列表的修改需要停用再启用 API 端点后才会生效。
-
-
-#### 2. Copy the endpoint url to your MCP client, like `Cherry Studio`  复制端点url到您的MCP客户端，如 `Cherry Studio`
-
-![mcp_urls](./_assets/mcp_urls.png)
-
-
-##### **Option 1:** Use the newest `Streamable HTTP` transport (**Recommended**)  使用最新的`Streamable HTTP`传输方式（**推荐**）
-
-![mcp_streamable_http_url](./_assets/mcp_streamable_http_url.png)
-
-![cherry_studio_mcp_streamable_http](./_assets/cherry_studio_mcp_streamable_http.png)
-
-**OK!**
-
-
-##### **Option 2:** Use the legacy `HTTP with SSE` transport  使用过时的`HTTP with SSE`传输方式
-
-![mcp_sse_url](./_assets/mcp_sse_url.png)
-
-![cherry_studio_mcp_sse](./_assets/cherry_studio_mcp_sse.png)
-
-**OK!**
-
-
-
----
-
-
-
-### Installing Plugins via GitHub  通过 GitHub 安装插件
-
-Can install the plugin using the GitHub repository address. Visit the Dify platform's plugin management page, choose to install via GitHub, enter the repository address, select version number and package file to complete installation.
-
-可以通过 GitHub 仓库地址安装该插件。访问 Dify 平台的插件管理页，选择通过 GitHub 安装插件，输入仓库地址后，选择版本号和包文件完成安装。
-
-![install_plugin_via_github](_assets/install_plugin_via_github.png)
-
-
-
----
-
-
-
-### FAQ
-
-#### 1. How to Handle Errors When Installing Plugins? 安装插件时遇到异常应如何处理？
-
-**Issue**: If you encounter the error message: plugin verification has been enabled, and the plugin you want to install has a bad signature, how to handle the issue?
-
-**Solution**: Add the following line to the end of your .env configuration file: FORCE_VERIFYING_SIGNATURE=false
-Once this field is added, the Dify platform will allow the installation of all plugins that are not listed (and thus not verified) in the Dify Marketplace.
-
-**问题描述**：安装插件时遇到异常信息：plugin verification has been enabled, and the plugin you want to install has a bad signature，应该如何处理？
-
-**解决办法**：在 .env 配置文件的末尾添加 FORCE_VERIFYING_SIGNATURE=false 字段即可解决该问题。
-添加该字段后，Dify 平台将允许安装所有未在 Dify Marketplace 上架（审核）的插件，可能存在安全隐患。
-
-
-#### 2. How to install the offline version 如何安装离线版本
-
-Scripting tool for downloading Dify plugin package from Dify Marketplace and Github and repackaging [true] offline package (contains dependencies, no need to be connected to the Internet).
-
-从Dify市场和Github下载Dify插件包并重新打【真】离线包（包含依赖，不需要再联网）的脚本工具。
-
-Github Repo: https://github.com/junjiem/dify-plugin-repackaging
-
+- **0.2.3** — MCP display metadata: `title` + light/dark `icons` from the Console provider
+  list (full URLs). 显示元数据（title + 明暗图标）。
+- **0.2.2** — Console auth corrected (`Authorization: Bearer` + `X-WORKSPACE-ID`, new
+  `dify_workspace_id` setting); fetched schemas slimmed so `tools/list` stays compact;
+  plugin-wide defaults with per-field inheritance; base-URL normalization.
+  鉴权修正 + 响应瘦身 + 插件级默认值 + 地址规范化。
+- **0.2.1** — Tool metadata resolution via read-only Console API; hide-on-unresolvable policy;
+  selector `auto=0` pinning. 通过 Console API 只读解析真实工具声明。
+- **0.2.0** — valid JSON Schema generation, Dify config-expression resolution, protected
+  server configuration, unified core for both transports, MCP-compliant error handling.
+  Schema 生成/配置解析/配置保护/统一核心/错误语义全面修复。
