@@ -15,7 +15,12 @@ import pytest
 
 from core.mcp_handler import dispatch
 from core.tool_adapter import adapt_tool_entry, adapt_tools, prepare_invoke_parameters, to_mcp_tool
-from core.tool_metadata import ToolMetadataResolver, _slim_parameter, clear_cache, request_headers
+from core.tool_metadata import (
+    ToolMetadataResolver,
+    _slim_parameter,
+    clear_cache,
+    request_headers,
+)
 
 from fixtures import FakeToolInvocation
 
@@ -100,6 +105,92 @@ def _resolver(fetcher):
         },
         fetcher=fetcher,
     )
+
+
+BUILTIN_PROVIDER_LIST = [
+    {
+        "name": "langgenius/tavily/tavily",
+        "label": {"en_US": "Tavily", "zh_Hans": "Tavily"},
+        "icon": "http://dify.local/assets/icon.svg",
+        "icon_dark": "http://dify.local/assets/icon-dark.svg",
+    },
+    {
+        "name": "langgenius/time/time",
+        "label": {"en_US": "Time"},
+        "icon": "http://dify.local/assets/time.svg",
+        "icon_dark": "",
+    },
+]
+
+
+def _icon_http_getter(path):
+    assert path == "/console/api/workspaces/current/tools/builtin"
+    return BUILTIN_PROVIDER_LIST
+
+
+def _resolver_with_icons(fetcher):
+    return ToolMetadataResolver(
+        {
+            "dify_console_api_base": "http://dify.local",
+            "dify_console_api_key": "k",
+            "dify_workspace_id": "ws-1",
+        },
+        fetcher=fetcher,
+        http_getter=_icon_http_getter,
+    )
+
+
+def test_mcp_tool_carries_title_and_icons_from_provider_list():
+    resolver = _resolver_with_icons(lambda base, provider: TAVILY_CONSOLE_TOOLS)
+    tool = adapt_tool_entry(real_selector_tavily(), resolver)
+    mcp = to_mcp_tool(tool)
+    assert mcp["title"] == "Tavily Search"  # tool's own label wins
+    assert mcp["icons"] == [
+        {"src": "http://dify.local/assets/icon.svg", "theme": "light"},
+        {"src": "http://dify.local/assets/icon-dark.svg", "theme": "dark"},
+    ]
+
+
+def test_icon_failure_does_not_hide_tool():
+    def failing_http(path):
+        raise RuntimeError("boom")
+
+    resolver = ToolMetadataResolver(
+        {
+            "dify_console_api_base": "http://dify.local",
+            "dify_console_api_key": "k",
+            "dify_workspace_id": "ws-1",
+        },
+        fetcher=lambda base, provider: TAVILY_CONSOLE_TOOLS,
+        http_getter=failing_http,
+    )
+    tool = adapt_tool_entry(real_selector_tavily(), resolver)
+    assert tool is not None
+    mcp = to_mcp_tool(tool)
+    assert "icons" not in mcp
+    assert mcp["title"] == "Tavily Search"
+
+
+def test_icon_meta_missing_provider_gives_empty_meta():
+    resolver = _resolver_with_icons(lambda base, provider: TAVILY_CONSOLE_TOOLS)
+    meta = resolver.get_icon_meta("some/unknown/provider")
+    assert meta.title == "" and meta.icon == "" and meta.icon_dark == ""
+
+
+def test_title_falls_back_to_provider_title_when_label_is_raw_id():
+    entry = real_selector_tavily()
+    entry["tool_label"] = "tavily_search"  # selector persisted the raw id
+    resolver = _resolver_with_icons(lambda base, provider: TAVILY_CONSOLE_TOOLS)
+    mcp = to_mcp_tool(adapt_tool_entry(entry, resolver))
+    assert mcp["title"] == "Tavily"
+
+
+def test_no_icons_field_when_resolver_has_no_icon_support():
+    # resolver without http_getter (fetcher-only tests) must not gain icons
+    resolver = _resolver(lambda base, provider: TAVILY_CONSOLE_TOOLS)
+    mcp = to_mcp_tool(adapt_tool_entry(real_selector_tavily(), resolver))
+    assert "icons" not in mcp
+    assert mcp["title"] == "Tavily Search"
 
 
 # --- real selector shape resolves its schema through the resolver ---

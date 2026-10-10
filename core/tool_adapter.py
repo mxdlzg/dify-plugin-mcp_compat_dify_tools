@@ -42,6 +42,9 @@ class AdaptedTool:
     provider_type: ToolProviderType
     description: str
     input_schema: dict[str, Any]
+    # optional display fields (MCP title / icons annotations)
+    title: str = ""
+    icons: list[dict[str, str]] = field(default_factory=list)
     # names of llm-form parameters (the only ones an agent may send)
     llm_param_names: set[str] = field(default_factory=set)
     # llm params not pinned by server config = the sendable surface
@@ -253,6 +256,11 @@ def adapt_tool_entry(
             return None
         param_dicts = params
 
+    # Display metadata (provider title + full-URL icons); never required, an
+    # unavailable entry must not hide a tool whose schema did resolve.
+    meta_getter = getattr(metadata_resolver, "get_icon_meta", None)
+    provider_meta = meta_getter(provider) if meta_getter else None
+
     input_schema, skipped = build_input_schema(param_dicts, pinned=config.keys())
     meta = _collect_schema_meta(param_dicts)
 
@@ -262,12 +270,36 @@ def adapt_tool_entry(
     # Params an agent may send: llm params not pinned by the server.
     sendable = meta["llm_names"] - set(config.keys())
 
+    icons: list[dict[str, str]] = []
+    if provider_meta is not None:
+        if getattr(provider_meta, "icon", ""):
+            icons.append({"src": provider_meta.icon, "theme": "light"})
+        if getattr(provider_meta, "icon_dark", ""):
+            icons.append({"src": provider_meta.icon_dark, "theme": "dark"})
+    def _is_raw_id(value: str) -> bool:
+        # getStructureValue() may store tool_label as the bare tool id; a
+        # human-readable title must not be "tavily_search" or a plugin id.
+        return value == name or value == provider
+
+    # MCP title is the tool-level display name: the tool's own label wins,
+    # then the provider title from the console list; a raw id is no title.
+    raw_title = _to_plain_text(raw.get("tool_label"))
+    provider_title = getattr(provider_meta, "title", "") or ""
+    if raw_title and not _is_raw_id(raw_title):
+        title = raw_title
+    elif provider_title and not _is_raw_id(provider_title):
+        title = provider_title
+    else:
+        title = ""
+
     return AdaptedTool(
         name=name,
         provider=provider,
         provider_type=_provider_type_from_selector(raw.get("type")),
         description=description,
         input_schema=input_schema,
+        title=title,
+        icons=icons,
         llm_param_names=meta["llm_names"],
         sendable_param_names=sendable,
         required_llm=[r for r in input_schema["required"]],
@@ -301,11 +333,18 @@ def adapt_tools(settings_tools: Any, metadata_resolver: Any | None = None) -> li
 
 
 def to_mcp_tool(tool: AdaptedTool) -> dict[str, Any]:
-    return {
+    result: dict[str, Any] = {
         "name": tool.name,
         "description": tool.description,
         "inputSchema": tool.input_schema,
     }
+    # Optional MCP display annotations; omitted when empty so older clients
+    # never see blank fields.
+    if tool.title:
+        result["title"] = tool.title
+    if tool.icons:
+        result["icons"] = tool.icons
+    return result
 
 
 def _coerce_value(name: str, tool: AdaptedTool, value: Any) -> Any:

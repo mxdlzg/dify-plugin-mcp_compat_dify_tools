@@ -17,6 +17,11 @@ The endpoint settings provide ``dify_console_api_base``,
 ``secret-input`` makes the daemon encrypt it at rest and decrypt it before
 invoking this endpoint.
 
+Provider display metadata (label, and the ``icon``/``icon_dark`` **full URLs**
+only served by the workspace provider list) comes from a second read:
+
+    GET {base}/console/api/workspaces/current/tools/builtin
+
 The response carries much more than the adapter needs (i18n labels,
 human-facing descriptions, placeholder/min/max metadata), so every parameter
 is slimmed to the fields the MCP schema actually uses before caching.
@@ -31,14 +36,18 @@ import logging
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from core.global_config import normalize_base
 
 logger = logging.getLogger(__name__)
 
-# (workspace_id, provider) -> (fetched_at_monotonic, tools-by-name or None-on-error)
-_CACHE: dict[tuple[str, str], tuple[float, dict[str, list[dict[str, Any]]] | None]] = {}
+# (workspace_id, provider) -> (fetched_at, (tools-by-name, provider_meta) | None)
+_CACHE: dict[
+    tuple[str, str],
+    tuple[float, tuple[dict[str, list[dict[str, Any]]], "ProviderMeta"] | None],
+] = {}
 
 Fetcher = Callable[[str, str], list[dict[str, Any]]]
 
@@ -86,11 +95,26 @@ def _slim_parameter(param: dict[str, Any]) -> dict[str, Any]:
     return slim
 
 
+@dataclass
+class ProviderMeta:
+    """Provider display metadata for MCP tool listings (never affects
+    exposure or invocation; an empty instance is a valid fallback)."""
+
+    title: str = ""
+    icon: str = ""        # full URL (light theme), from the provider list API
+    icon_dark: str = ""   # full URL (dark theme), may be empty
+
+
+# (base, workspace_id) -> (fetched_at, full builtin-provider list or None)
+_PROVIDER_LIST_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]] | None]] = {}
+
+
 class ToolMetadataResolver:
     """Resolve original tool parameter schemas, with a per-provider cache."""
 
     def __init__(self, settings: Any, cache_ttl: float = 300.0,
-                 fetcher: Fetcher | None = None) -> None:
+                 fetcher: Fetcher | None = None,
+                 http_getter: Callable[[str], Any] | None = None) -> None:
         base = ""
         api_key = ""
         workspace_id = ""
@@ -105,6 +129,7 @@ class ToolMetadataResolver:
         self._workspace_id = workspace_id
         self._cache_ttl = cache_ttl
         self._fetcher = fetcher
+        self._http_getter = http_getter
 
     @property
     def configured(self) -> bool:
@@ -166,6 +191,86 @@ class ToolMetadataResolver:
         _CACHE[cache_key] = (now, tools)
         return tools
 
+    def _http_get_json(self, path: str) -> Any:
+        if self._http_getter is not None:
+            return self._http_getter(path)
+        url = f"{self._base}{path}"
+        request = urllib.request.Request(
+            url, headers=request_headers(self._api_key, self._workspace_id)
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _get_provider_list(
+        self, provider: str
+    ) -> tuple[list[dict[str, Any]] | None, ProviderMeta]:
+        """Fetch the builtin provider list (icons are full URLs only here).
+
+        Returns (raw_list_or_None, ProviderMeta). A list-fetch failure or a
+        missing entry degrades to empty metadata — the tool itself must stay
+        exposed as long as its schema resolved.
+        """
+
+        now = time.monotonic()
+        list_cache_key = (self._base, self._workspace_id)
+        cached = _PROVIDER_LIST_CACHE.get(list_cache_key)
+        if cached and now - cached[0] < self._cache_ttl:
+            entries = cached[1]
+        else:
+            entries = None
+            try:
+                payload = self._http_get_json(
+                    "/console/api/workspaces/current/tools/builtin"
+                )
+                entries = (
+                    payload if isinstance(payload, list) else payload.get("data", [])
+                )
+            except Exception as exc:
+                status = getattr(exc, "status", None) or getattr(exc, "code", None)
+                logger.warning(
+                    "Provider list fetch failed error=%s%s",
+                    type(exc).__name__, f" status={status}" if status else "",
+                )
+            _PROVIDER_LIST_CACHE[list_cache_key] = (now, entries)
+
+        if not entries:
+            return entries, ProviderMeta()
+
+        def matches(entry: dict[str, Any]) -> bool:
+            name = str(entry.get("name") or "")
+            return bool(name) and (
+                name == provider
+                or name.endswith("/" + provider)
+                or provider.endswith("/" + name)
+            )
+
+        for entry in entries:
+            if isinstance(entry, dict) and matches(entry):
+                return entries, ProviderMeta(
+                    title=_pick_i18n(entry.get("label")),
+                    icon=str(entry.get("icon") or ""),
+                    icon_dark=str(entry.get("icon_dark") or ""),
+                )
+        return entries, ProviderMeta()
+
+    def get_icon_meta(self, provider: str) -> ProviderMeta:
+        """Display metadata (title/icons) for a provider; never fails."""
+
+        if not provider:
+            return ProviderMeta()
+        if self._http_getter is None:
+            # No injected HTTP for the provider list: only hit the network in
+            # the fully-configured production path. A fetcher-only resolver
+            # (tests) must never trigger a real request here.
+            if self._fetcher is not None or not self.configured:
+                return ProviderMeta()
+        try:
+            _, meta = self._get_provider_list(provider)
+        except Exception:
+            logger.warning("Icon metadata unavailable provider=%s", provider)
+            return ProviderMeta()
+        return meta
+
     def get_parameters(
         self, provider: str, tool_name: str
     ) -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -192,3 +297,4 @@ class ToolMetadataResolver:
 
 def clear_cache() -> None:
     _CACHE.clear()
+    _PROVIDER_LIST_CACHE.clear()
