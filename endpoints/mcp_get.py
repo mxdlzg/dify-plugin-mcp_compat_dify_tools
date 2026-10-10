@@ -1,5 +1,7 @@
 from typing import Mapping
 
+import json
+
 from dify_plugin import Endpoint
 from werkzeug import Request, Response
 
@@ -19,4 +21,4 @@ class McpGetEndpoint(Endpoint):
             },
         }
 
-        return Response(response, status=405, content_type="application/json")
+        return Response(json.dumps(response), status=405, content_type="application/json")

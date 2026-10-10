@@ -176,3 +176,8 @@ cython_debug/
 
 # Windows
 Thumbs.db
+
+# Local development (not needed in the plugin package)
+tests/
+DESIGN_NOTES.md
+*.egg-info/
