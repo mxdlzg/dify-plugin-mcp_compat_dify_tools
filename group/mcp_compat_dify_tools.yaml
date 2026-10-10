@@ -5,6 +5,24 @@ settings:
     label:
       en_US: Tool list
       zh_Hans: 工具列表
+  - name: dify_console_api_base
+    type: text-input
+    required: false
+    label:
+      en_US: Dify console API base URL (for tool schemas)
+      zh_Hans: Dify Console API 地址（用于获取工具 Schema）
+    help:
+      en_US: "Base URL of this Dify instance, e.g. http://host.docker.internal:5001 (the plugin container must be able to reach it). Required to expose tool parameter schemas."
+      zh_Hans: "本 Dify 实例的基地址，例如 http://host.docker.internal:5001（需保证插件容器可访问）。获取工具参数 Schema 必填。"
+  - name: dify_console_api_key
+    type: secret-input
+    required: false
+    label:
+      en_US: Dify console API key
+      zh_Hans: Dify Console API Key
+    help:
+      en_US: "Settings -> API in Dify. Used read-only to fetch tool parameter schemas; stored encrypted by the plugin daemon."
+      zh_Hans: "Dify「设置 -> API」页面创建。仅用于只读获取工具参数 Schema；由插件守护进程加密存储。"
 endpoints:
   - endpoints/sse.yaml
   - endpoints/messages.yaml

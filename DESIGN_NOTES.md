@@ -1,5 +1,27 @@
 # Design Notes — v0.2.0 MCP parameter adaptation fix
 
+## v0.2.1 addendum — the real root cause (Dify source-verified)
+
+- Dify's endpoint tool selector (`getToolValue()`) persists values only:
+  `settings` (form params, DOUBLE-wrapped `{value:{type,value}}`) and
+  `parameters` (`{auto, value:{type,value}}`, auto=0 pinned / auto=1 LLM).
+  No type/required/description is ever persisted.
+- The Dify backend (`endpoint.py` controller -> `endpoint_service` -> daemon
+  `endpoint.go`) forwards settings verbatim (only secret-input decryption).
+  `schemas` never existed in any Dify version's endpoint settings.
+- Neither the plugin SDK nor the daemon expose a backwards invocation to query
+  another plugin's tool declaration (`INVOKE_TYPE_*` has no tool-schema type;
+  `get_tool_runtime_parameters` only serves a plugin's own tools).
+- Resolution: read-only Console API fetch
+  `GET /console/api/workspaces/current/tool-provider/builtin/{provider}/tools`
+  returning `ToolApiEntity.parameters` (full ToolParameter serialization).
+  Endpoint settings `dify_console_api_base` + `dify_console_api_key`
+  (secret-input, daemon-encrypted). Per-provider cache (300s). Never invoked.
+  Unresolvable tools are hidden, not advertised with empty schemas.
+- Caveats: plugin container must reach the Dify API (host.docker.internal /
+  compose service name); console key requires an extra manual step; inline
+  `schemas`/`tool_parameters` fixtures remain supported.
+
 ## Root cause analysis
 
 ### A. Empty MCP inputSchema

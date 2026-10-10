@@ -133,14 +133,42 @@ def _collect_schema_meta(params: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def adapt_tool_entry(raw: dict[str, Any]) -> AdaptedTool | None:
+def _selector_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Server-pinned values from the selector shape.
+
+    ``settings`` entries are always pinned. ``parameters`` entries with
+    ``auto == 0`` were switched from LLM-filled to a user-fixed value in the
+    selector UI (``auto == 1`` means the agent fills it); their value is the
+    inner expression object, resolved later by parameter_resolver.
+    """
+
+    config = dict(raw.get("settings") or {})
+    parameters = raw.get("parameters") or {}
+    if isinstance(parameters, dict):
+        for key, entry in parameters.items():
+            if (
+                isinstance(entry, dict)
+                and entry.get("auto") == 0
+                and "value" in entry
+            ):
+                config[key] = entry.get("value")
+    return config
+
+
+def adapt_tool_entry(
+    raw: dict[str, Any],
+    metadata_resolver: Any | None = None,
+) -> AdaptedTool | None:
     """Adapt one endpoint tool entry to an :class:`AdaptedTool`.
 
-    Accepts both known Dify shapes:
-    - schemas-style: ``schemas`` (full ToolParameter list) + ``settings``
-    - selector-style: ``tool_parameters`` (llm params) + ``tool_configuration``
+    Metadata priority:
+    1. inline schema in the entry (``schemas`` / ``tool_parameters``)
+    2. ``metadata_resolver`` (Dify Console API) for the real selector shape,
+       which persists only values, never schemas
+    If neither yields a schema the entry is NOT exposed — an empty schema for
+    a tool whose parameters are unknown would silently invite wrong calls.
 
-    Returns ``None`` for disabled or malformed entries.
+    Returns ``None`` for disabled, malformed, or schema-unresolvable entries.
     """
 
     if not raw.get("enabled", False):
@@ -195,23 +223,34 @@ def adapt_tool_entry(raw: dict[str, Any]) -> AdaptedTool | None:
         param_dicts = []
         config = dict(raw.get("tool_configuration") or raw.get("settings") or {})
     else:
-        # No parameter *schema* anywhere. The Dify tool-selector may still have
-        # sent a `parameters`/`settings` *value* map (provider_name/tool_name +
-        # values only, no type/required/description). Those keys are NOT a
-        # schema and must not be guessed into one (taskbook: forbidden to infer
-        # type/required from `parameters` keys). Treat as metadata-missing.
-        value_only_keys = sorted(
-            set((raw.get("parameters") or {}).keys())
-            | set((raw.get("settings") or {}).keys())
-        )
-        param_dicts = []
-        config = dict(raw.get("settings") or {})
-        logger.warning(
-            "Tool '%s': no parameter schema in endpoint settings "
-            "(looked for 'schemas' / 'tool_parameters'); value-only keys seen "
-            "= %s. Advertising without schema until a metadata source is wired.",
-            name, value_only_keys,
-        )
+        # Real Dify selector shape: `parameters`/`settings` carry VALUES only
+        # (no type/required/description). Type/required must come from the
+        # metadata resolver (Console API); guessing them from key names is
+        # forbidden. Even a tool with no configured values is verified through
+        # the resolver — an empty config is indistinguishable from an
+        # all-defaults config of a required-parameter tool. Without a schema
+        # the tool is not exposed (taskbook C).
+        config = _selector_config(raw)
+        resolver = metadata_resolver
+        if resolver is None or not getattr(resolver, "configured", False):
+            logger.warning(
+                "Tool '%s': no inline parameter schema and no console API "
+                "metadata configured (set dify_console_api_base/"
+                "dify_console_api_key on this endpoint); not exposing the "
+                "tool. value-only keys seen = %s",
+                name,
+                sorted(set((raw.get("parameters") or {}).keys())
+                       | set(config.keys())),
+            )
+            return None
+        params, reason = resolver.get_parameters(provider, name)
+        if params is None:
+            logger.warning(
+                "Tool '%s': schema unavailable (%s); not exposing it to avoid "
+                "advertising a wrong signature.", name, reason,
+            )
+            return None
+        param_dicts = params
 
     input_schema, skipped = build_input_schema(param_dicts, pinned=config.keys())
     meta = _collect_schema_meta(param_dicts)
@@ -240,7 +279,7 @@ def adapt_tool_entry(raw: dict[str, Any]) -> AdaptedTool | None:
     )
 
 
-def adapt_tools(settings_tools: Any) -> list[AdaptedTool]:
+def adapt_tools(settings_tools: Any, metadata_resolver: Any | None = None) -> list[AdaptedTool]:
     """Adapt the whole ``settings["tools"]`` list, skipping bad entries."""
 
     tools: list[AdaptedTool] = []
@@ -251,7 +290,7 @@ def adapt_tools(settings_tools: Any) -> list[AdaptedTool]:
         if not isinstance(entry, dict):
             continue
         try:
-            adapted = adapt_tool_entry(entry)
+            adapted = adapt_tool_entry(entry, metadata_resolver)
         except Exception:
             logger.exception("Failed to adapt Dify tool entry to MCP tool")
             continue

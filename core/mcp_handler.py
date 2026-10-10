@@ -23,6 +23,7 @@ from core.tool_adapter import (
     prepare_invoke_parameters,
     to_mcp_tool,
 )
+from core.tool_metadata import ToolMetadataResolver
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,14 @@ def dispatch(
     return rpc_error(req_id, -32601, f"Unsupported method: {method}")
 
 
+def _resolver(settings: Mapping) -> ToolMetadataResolver:
+    # The provider-level cache lives in core.tool_metadata and survives across
+    # requests, so building this per-call is cheap.
+    return ToolMetadataResolver(settings)
+
+
 def _tools_list(req_id: Any, settings: Mapping) -> dict[str, Any]:
-    tools = adapt_tools(settings.get("tools"))
+    tools = adapt_tools(settings.get("tools"), _resolver(settings))
     return rpc_result(req_id, {"tools": [to_mcp_tool(t) for t in tools]})
 
 
@@ -73,7 +80,7 @@ def _tools_call(
     tool_name = params.get("name")
     arguments = params.get("arguments") or {}
 
-    tools = {t.name: t for t in adapt_tools(settings.get("tools"))}
+    tools = {t.name: t for t in adapt_tools(settings.get("tools"), _resolver(settings))}
     tool = tools.get(tool_name)
     if tool is None:
         # Per MCP semantics a failed tool call is a tool result with

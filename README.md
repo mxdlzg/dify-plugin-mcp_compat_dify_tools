@@ -29,6 +29,51 @@ Convert your Dify tools's API to MCP compatible API (**Currently, two transports
 > **注：** 本分支要求 dify_plugin >= 0.10.2（Python 3.12 runner），修复了 MCP 客户端看到的工具
 > 参数 Schema 生成问题和 Dify 配置参数解析问题，详见下文“v0.2.0 变更”。
 
+### v0.2.1 changes v0.2.1 变更
+
+**Tool Metadata Resolution Fix — required setup for tool schemas 工具元数据解析修复（获取工具 Schema 的必填配置）**
+
+Root cause discovered with Dify source evidence: the Dify endpoint tool selector
+(`getToolValue()` in `use-tool-selector.ts`) persists **values only** (`parameters` +
+`settings`, no type/required/description), and the Dify backend + plugin daemon forward
+endpoint settings verbatim — a tool parameter **schema never reaches this plugin through
+endpoint settings**. The plugin SDK and daemon provide no backwards-invocation to query
+another plugin's tool declaration.
+
+根因（有 Dify 源码证据）：Dify Endpoint 工具选择器只持久化**值**（`parameters`+`settings`，
+不含类型/必填/描述），后端与 daemon 对 settings 原样转发 —— 工具参数 **Schema 永远不会通过
+Endpoint 配置到达本插件**；SDK 与 daemon 也没有查询其他插件工具声明的反向调用通道。
+
+Fix 修复方式: at `tools/list`/`tools/call` the plugin now **reads** (never invokes) the
+original tool definition from the Dify Console API
+`GET /console/api/workspaces/current/tool-provider/builtin/{provider}/tools`
+(read-only, per-provider cache, `X-Api-Key` auth). Two new endpoint settings appear:
+
+- `dify_console_api_base` — base URL of your Dify instance reachable **from the plugin
+  container**, e.g. `http://host.docker.internal:5001` (docker) or `http://api:5001`
+  (same compose network)
+- `dify_console_api_key` — `secret-input`, created in Dify **Settings → API**; the daemon
+  stores it encrypted. Used only for read-only schema fetches.
+
+If these are not configured or a schema cannot be fetched, the tool is **not exposed**
+(logged with a reason) instead of being advertised with a misleading empty schema.
+Tools that truly have no parameters return an empty list from the Console API and are
+still exposed normally.
+
+未配置或拉取失败的工具将**不再暴露**（日志说明原因），而不是用误导性的空 Schema 上架；
+真正无参数的工具（Console API 返回空列表）照常暴露。
+
+Setup steps 配置步骤：
+1. Upgrade the plugin to 0.2.1, disable + re-enable the endpoint 升级插件后停用再启用端点
+2. Edit the endpoint: fill `dify_console_api_base` and create/paste a console API key
+   编辑端点：填 Console API 地址并创建/粘贴 API Key
+3. `tools/list` should now show real schemas (Tavily: required `query`) `tools/list`
+   将显示真实 Schema（Tavily 出现必填 `query`）
+
+Also in 0.2.1 同期修复：settings double-wrapper unwrapping (real shape is
+`{value: {type: constant, value: X}}`), metadata-source selection no longer locked by an
+empty `schemas` key, `TOOL_META_DIAG` diagnostics, real version in `serverInfo`.
+
 ### v0.2.0 changes v0.2.0 变更
 
 1. **MCP inputSchema is generated correctly.** Dify tool parameters are converted to valid
