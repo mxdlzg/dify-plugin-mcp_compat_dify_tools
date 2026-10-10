@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dify_plugin import Endpoint
 from werkzeug import Request, Response
 
+from core.global_config import resolve_settings
 from core.mcp_handler import dispatch
 from core.server_info import SERVER_NAME, SERVER_VERSION
 from core.tool_adapter import AdaptedTool
@@ -50,7 +51,7 @@ class MessageEndpoint(Endpoint):
                 method,
                 data.get("id"),
                 data.get("params") or {},
-                settings,
+                resolve_settings(settings, self.session.storage),
                 self._invoke_tool,
             )
 

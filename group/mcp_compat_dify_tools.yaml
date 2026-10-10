@@ -12,8 +12,8 @@ settings:
       en_US: Dify console API base URL (for tool schemas)
       zh_Hans: Dify Console API 地址（用于获取工具 Schema）
     help:
-      en_US: "Base URL of this Dify instance, e.g. http://host.docker.internal:5001 (the plugin container must be able to reach it). Required to expose tool parameter schemas."
-      zh_Hans: "本 Dify 实例的基地址，例如 http://host.docker.internal:5001（需保证插件容器可访问）。获取工具参数 Schema 必填。"
+      en_US: "Base URL of this Dify instance, e.g. http://host.docker.internal:5001 (the plugin container must be able to reach it). Leave empty to inherit the value registered by another endpoint of this plugin; fill all three fields to register/override them for this endpoint."
+      zh_Hans: "本 Dify 实例的基地址，例如 http://host.docker.internal:5001（需保证插件容器可访问）。留空则自动继承本插件其它端点已登记的默认值；三个字段全部填写则登记为默认值并对本端点生效。"
   - name: dify_console_api_key
     type: secret-input
     required: false
@@ -21,8 +21,17 @@ settings:
       en_US: Dify console API key
       zh_Hans: Dify Console API Key
     help:
-      en_US: "Settings -> API in Dify. Used read-only to fetch tool parameter schemas; stored encrypted by the plugin daemon."
-      zh_Hans: "Dify「设置 -> API」页面创建。仅用于只读获取工具参数 Schema；由插件守护进程加密存储。"
+      en_US: "Settings -> API in Dify. Sent as Authorization: Bearer <key>, read-only, to fetch tool parameter schemas; stored encrypted by the plugin daemon. Leave empty to inherit the registered default."
+      zh_Hans: "Dify「设置 -> API」页面创建。以 Authorization: Bearer <key> 发送，仅用于只读获取工具参数 Schema；由插件守护进程加密存储。留空则自动继承已登记的默认值。"
+  - name: dify_workspace_id
+    type: text-input
+    required: false
+    label:
+      en_US: Dify workspace ID
+      zh_Hans: Dify 团队 ID
+    help:
+      en_US: "Sent as the X-WORKSPACE-ID header when fetching tool schemas (the console API always requires it). Get it from your workspace settings, e.g. c4ae3307-d5b5-4e0d-acf6-9f82e4a2559d. Leave empty to inherit the registered default."
+      zh_Hans: "获取工具 Schema 时作为 X-WORKSPACE-ID 请求头发送（Console API 必需）。在团队设置中查看，例如 c4ae3307-d5b5-4e0d-acf6-9f82e4a2559d。留空则自动继承已登记的默认值。"
 endpoints:
   - endpoints/sse.yaml
   - endpoints/messages.yaml

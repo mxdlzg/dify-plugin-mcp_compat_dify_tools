@@ -27,6 +27,21 @@ def is_unsupported_type(param_type: str) -> bool:
     return param_type in UNSUPPORTED_TYPES
 
 
+def _flatten_description(value: Any) -> str:
+    """Descriptions must be one plain string, never an i18n object.
+
+    Console-API params are already slimmed to a string; inline fixture schemas
+    may still carry ``{"en_US": .., "zh_Hans": ..}``.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("en_US", "zh_Hans"):
+            if value.get(key):
+                return str(value[key])
+    return ""
+
+
 def build_property_schema(
     *,
     param_type: str,
@@ -123,7 +138,9 @@ def build_input_schema(
             continue
         properties[name] = build_property_schema(
             param_type=ptype,
-            description=param.get("llm_description") or param.get("human_description") or "",
+            description=_flatten_description(
+                param.get("llm_description") or param.get("human_description")
+            ),
             options=param.get("options"),
             input_schema=param.get("input_schema"),
             multiple=bool(param.get("multiple")),

@@ -10,11 +10,16 @@ So the schema is read — never invoked — from the Console API:
 
     GET {base}/console/api/workspaces/current/tool-provider/builtin/{provider}/tools
 
-which returns ``ToolApiEntity`` objects whose ``parameters`` are full
-``ToolParameter`` serializations (name/type/form/required/llm_description/
-options). The endpoint settings must provide ``dify_console_api_base`` and
-``dify_console_api_key``; declaring the key as ``secret-input`` makes the
-daemon encrypt it at rest and decrypt it before invoking this endpoint.
+authenticating with ``Authorization: Bearer <key>`` and
+``X-WORKSPACE-ID: <workspace id>`` (verified against a live Dify instance).
+The endpoint settings provide ``dify_console_api_base``,
+``dify_console_api_key`` and ``dify_workspace_id``; declaring the key as
+``secret-input`` makes the daemon encrypt it at rest and decrypt it before
+invoking this endpoint.
+
+The response carries much more than the adapter needs (i18n labels,
+human-facing descriptions, placeholder/min/max metadata), so every parameter
+is slimmed to the fields the MCP schema actually uses before caching.
 
 This module performs read-only GETs. It never calls the tools themselves.
 """
@@ -24,26 +29,61 @@ from __future__ import annotations
 import json
 import logging
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
+from core.global_config import normalize_base
+
 logger = logging.getLogger(__name__)
 
-# provider -> (fetched_at_monotonic, tools-by-name or None-on-error)
-_CACHE: dict[str, tuple[float, dict[str, list[dict[str, Any]]] | None]] = {}
+# (workspace_id, provider) -> (fetched_at_monotonic, tools-by-name or None-on-error)
+_CACHE: dict[tuple[str, str], tuple[float, dict[str, list[dict[str, Any]]] | None]] = {}
 
 Fetcher = Callable[[str, str], list[dict[str, Any]]]
 
+# Fields an MCP inputSchema is built from; everything else in a Console API
+# parameter (i18n label, human_description, placeholder, min/max, precision,
+# default, scope, template, auto_generate, icon...) is dropped at fetch time.
+_KEEP_PARAM_KEYS = ("name", "type", "form", "required", "multiple", "input_schema")
 
-def _console_request_json(url: str, api_key: str, timeout: float) -> Any:
-    request = urllib.request.Request(
-        url,
-        headers={"X-Api-Key": api_key, "Accept": "application/json"},
+
+def request_headers(api_key: str, workspace_id: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "X-WORKSPACE-ID": workspace_id,
+        "Accept": "application/json",
+    }
+
+
+def _pick_i18n(value: Any) -> str:
+    """Flatten an I18n object or plain string to one string (prefer en_US)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("en_US", "zh_Hans"):
+            if value.get(key):
+                return str(value[key])
+    return ""
+
+
+def _slim_parameter(param: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the fields the schema converter/adapters need."""
+
+    slim = {k: param[k] for k in _KEEP_PARAM_KEYS if param.get(k) is not None}
+    description = param.get("llm_description") or _pick_i18n(
+        param.get("human_description")
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    if description:
+        slim["llm_description"] = description
+    options = param.get("options")
+    if options:
+        slim["options"] = [
+            {"value": o.get("value")}
+            for o in options
+            if isinstance(o, dict) and o.get("value") is not None
+        ]
+    return slim
 
 
 class ToolMetadataResolver:
@@ -53,31 +93,36 @@ class ToolMetadataResolver:
                  fetcher: Fetcher | None = None) -> None:
         base = ""
         api_key = ""
+        workspace_id = ""
         try:
-            base = str(settings.get("dify_console_api_base") or "").rstrip("/")
+            base = str(settings.get("dify_console_api_base") or "").strip()
             api_key = str(settings.get("dify_console_api_key") or "")
+            workspace_id = str(settings.get("dify_workspace_id") or "")
         except AttributeError:
             pass
-        self._base = base
+        self._base = normalize_base(base)
         self._api_key = api_key
+        self._workspace_id = workspace_id
         self._cache_ttl = cache_ttl
         self._fetcher = fetcher
 
     @property
     def configured(self) -> bool:
-        return bool(self._base and self._api_key)
+        return bool(self._base and self._api_key and self._workspace_id)
 
     def _missing_config_reason(self) -> str:
         return (
-            "endpoint settings are missing 'dify_console_api_base' or "
-            "'dify_console_api_key'; original tool schemas cannot be fetched"
+            "endpoint settings are missing 'dify_console_api_base', "
+            "'dify_console_api_key' or 'dify_workspace_id'; original tool "
+            "schemas cannot be fetched"
         )
 
     def _fetch_provider(self, provider: str) -> dict[str, list[dict[str, Any]]] | None:
-        """Return {tool_name: parameters-list} for one provider, or None."""
+        """Return {tool_name: slimmed-parameters-list} for one provider, or None."""
 
+        cache_key = (self._workspace_id, provider)
         now = time.monotonic()
-        cached = _CACHE.get(provider)
+        cached = _CACHE.get(cache_key)
         if cached and now - cached[0] < self._cache_ttl:
             return cached[1]
 
@@ -90,15 +135,24 @@ class ToolMetadataResolver:
                     raise RuntimeError(self._missing_config_reason())
                 url = (
                     f"{self._base}/console/api/workspaces/current/"
-                    f"tool-provider/builtin/{urllib.parse.quote(provider, safe='')}/tools"
+                    f"tool-provider/builtin/"
+                    f"{urllib.parse.quote(provider, safe='/')}/tools"
                 )
-                payload = _console_request_json(url, self._api_key, timeout=10)
+                request = urllib.request.Request(
+                    url, headers=request_headers(self._api_key, self._workspace_id)
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
                 data = payload if isinstance(payload, list) else payload.get("data", [])
 
             tools = {}
             for tool in data or []:
                 if isinstance(tool, dict) and tool.get("name"):
-                    tools[tool["name"]] = tool.get("parameters") or []
+                    tools[tool["name"]] = [
+                        _slim_parameter(p)
+                        for p in (tool.get("parameters") or [])
+                        if isinstance(p, dict)
+                    ]
         except Exception as exc:
             # Log type + HTTP status only; response bodies may be large and
             # provider errors can echo request details.
@@ -109,7 +163,7 @@ class ToolMetadataResolver:
             )
             tools = None
 
-        _CACHE[provider] = (now, tools)
+        _CACHE[cache_key] = (now, tools)
         return tools
 
     def get_parameters(

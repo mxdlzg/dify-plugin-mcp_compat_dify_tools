@@ -5,4 +5,4 @@ the Endpoint class cannot read the manifest through the SDK.
 """
 
 SERVER_NAME = "MCP Compatible Dify Tools"
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.2.2"

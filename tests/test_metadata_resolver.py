@@ -15,7 +15,7 @@ import pytest
 
 from core.mcp_handler import dispatch
 from core.tool_adapter import adapt_tool_entry, adapt_tools, prepare_invoke_parameters, to_mcp_tool
-from core.tool_metadata import ToolMetadataResolver, clear_cache
+from core.tool_metadata import ToolMetadataResolver, _slim_parameter, clear_cache, request_headers
 
 from fixtures import FakeToolInvocation
 
@@ -93,7 +93,11 @@ def _clear_cache():
 
 def _resolver(fetcher):
     return ToolMetadataResolver(
-        {"dify_console_api_base": "http://dify.local", "dify_console_api_key": "k"},
+        {
+            "dify_console_api_base": "http://dify.local",
+            "dify_console_api_key": "k",
+            "dify_workspace_id": "ws-1",
+        },
         fetcher=fetcher,
     )
 
@@ -171,25 +175,22 @@ def test_zero_parameter_tool_verified_empty_and_exposed():
 
 
 def test_tools_list_over_http_flow_uses_console_api():
-    resolver_seen = []
-
-    def fetcher(base, provider):
-        resolver_seen.append((base, provider))
-        return TAVILY_CONSOLE_TOOLS
-
-    # dispatch builds its own ToolMetadataResolver from settings; inject via
-    # monkeypatched module-level settings containing base+key and a stub
-    # transport by patching the class-level cache directly.
+    # dispatch builds its own ToolMetadataResolver from settings; simulate a
+    # warm provider cache (keyed by workspace+provider, slimmed parameters) so
+    # no real HTTP happens.
     from core import tool_metadata
 
-    tool_metadata._CACHE["langgenius/tavily/tavily"] = (
+    tool_metadata._CACHE[("ws-1", "langgenius/tavily/tavily")] = (
         tool_metadata.time.monotonic(),
-        {"tavily_search": TAVILY_CONSOLE_TOOLS[0]["parameters"]},
+        {"tavily_search": [
+            {"name": "query", "type": "string", "form": "llm", "required": True},
+        ]},
     )
     settings = {
         "tools": [real_selector_tavily()],
         "dify_console_api_base": "http://dify.local",
         "dify_console_api_key": "k",
+        "dify_workspace_id": "ws-1",
     }
     resp = dispatch("tools/list", 1, {}, settings, lambda t, p: [])
     tools = resp["result"]["tools"]
@@ -204,3 +205,81 @@ def test_tools_list_over_http_flow_uses_console_api():
     )
     assert resp["result"]["isError"] is False
     assert inv.calls[0]["parameters"] == {"query": "hello", "include_answer": "false"}
+
+
+# --- console fetch shape: auth headers and slimmed parameters ---
+
+def test_console_auth_headers_match_verified_curl():
+    assert request_headers("secret-key", "ws-abc") == {
+        "Authorization": "Bearer secret-key",
+        "X-WORKSPACE-ID": "ws-abc",
+        "Accept": "application/json",
+    }
+
+
+def test_console_url_keeps_provider_slashes_unescaped():
+    # Matches the verified-working path: builtin/{provider with slashes}/tools
+    import urllib.parse
+
+    provider = "langgenius/tavily/tavily"
+    quoted = urllib.parse.quote(provider, safe="/")
+    assert quoted == "langgenius/tavily/tavily"
+    url = (
+        f"http://api:5001/console/api/workspaces/current/tool-provider/"
+        f"builtin/{quoted}/tools"
+    )
+    assert url.endswith("/tool-provider/builtin/langgenius/tavily/tavily/tools")
+    assert "%2F" not in url
+
+
+def test_resolver_requires_workspace_id():
+    resolver = ToolMetadataResolver(
+        {"dify_console_api_base": "http://dify.local", "dify_console_api_key": "k"},
+        fetcher=lambda base, provider: [],
+    )
+    assert resolver.configured is False
+    assert adapt_tool_entry(real_selector_tavily(), resolver) is None
+
+
+def test_slim_parameter_keeps_only_mcp_relevant_fields():
+    real_console_param = {
+        "name": "search_depth",
+        "label": {"en_US": "Search Depth", "zh_Hans": "搜索深度"},
+        "placeholder": None, "scope": None, "auto_generate": None,
+        "template": None, "required": False, "default": "basic",
+        "min": None, "max": None, "precision": None,
+        "options": [
+            {"value": "basic", "label": {"en_US": "Basic"}, "icon": ""},
+            {"value": "advanced", "label": {"en_US": "Advanced"}, "icon": ""},
+        ],
+        "type": "select", "multiple": False,
+        "human_description": {"en_US": "The depth of the search."},
+        "form": "llm",
+        "llm_description": "The depth of the search.",
+        "input_schema": None,
+    }
+    slim = _slim_parameter(real_console_param)
+    assert slim == {
+        "name": "search_depth",
+        "type": "select",
+        "form": "llm",
+        "required": False,
+        "multiple": False,
+        "llm_description": "The depth of the search.",
+        "options": [{"value": "basic"}, {"value": "advanced"}],
+    }
+    # and the slimmed param still produces the correct MCP property schema
+    schema = to_mcp_tool(adapt_tool_entry(
+        {
+            "provider_name": "p", "tool_name": "t", "enabled": True,
+            "settings": {}, "parameters": {},
+        },
+        _resolver(lambda base, provider: [
+            {"name": "t", "parameters": [real_console_param]},
+        ]),
+    ))["inputSchema"]
+    assert schema["properties"]["search_depth"] == {
+        "type": "string",
+        "enum": ["basic", "advanced"],
+        "description": "The depth of the search.",
+    }

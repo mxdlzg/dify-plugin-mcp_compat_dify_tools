@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dify_plugin import Endpoint
 from werkzeug import Request, Response
 
+from core.global_config import resolve_settings
 from core.mcp_handler import dispatch
 from core.server_info import SERVER_NAME, SERVER_VERSION
 from core.tool_adapter import AdaptedTool
@@ -54,7 +55,7 @@ class McpPostEndpoint(Endpoint):
             method,
             req_id,
             data.get("params") or {},
-            settings,
+            resolve_settings(settings, self.session.storage),
             self._invoke_tool,
         )
         return Response(

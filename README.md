@@ -29,6 +29,44 @@ Convert your Dify tools's API to MCP compatible API (**Currently, two transports
 > **注：** 本分支要求 dify_plugin >= 0.10.2（Python 3.12 runner），修复了 MCP 客户端看到的工具
 > 参数 Schema 生成问题和 Dify 配置参数解析问题，详见下文“v0.2.0 变更”。
 
+### v0.2.2 changes v0.2.2 变更
+
+**Console API authentication corrected + slimmer MCP definitions Console API 鉴权方式修正 + MCP 定义瘦身**
+
+The Console API schema fetch was verified against a live Dify instance: it requires
+`Authorization: Bearer <key>` plus an **`X-WORKSPACE-ID`** header (not `X-Api-Key`). A new
+endpoint setting `dify_workspace_id` (team ID, from workspace settings) is now **required**
+together with the base URL and API key; tools are not exposed until all three are set.
+
+实测确认：Console API 需要 `Authorization: Bearer <key>` 和 **`X-WORKSPACE-ID`** 头（而非
+`X-Api-Key`）。新增 Endpoint 配置项 `dify_workspace_id`（团队 ID，见「团队设置」），与地址、Key
+三者齐备才会暴露工具。
+
+Fetched schemas are slimmed before caching and never passed through verbatim: each parameter
+keeps only `name/type/form/required/multiple/input_schema`, one `llm_description` string
+(prefer en_US; i18n objects are flattened) and `options[].value`. i18n labels,
+human_description, placeholder, min/max/default, author, labels etc. no longer reach the MCP
+client, so `tools/list` stays compact. 拉取的 Schema 在缓存前即瘦身：仅保留
+`name/type/form/required/multiple/input_schema`、单一 `llm_description` 字符串与
+`options[].value`；i18n 标签、human_description、placeholder、min/max、author 等一律不进入
+`tools/list`。
+
+Also: the temporary `MCP_SCHEMA_DIAG` diagnostic has been removed. 临时诊断代码已移除。
+
+**Plugin-wide defaults, per-endpoint override 插件级默认值 + 端点级覆盖**
+
+The three console settings are now registered plugin-wide on first use: an endpoint that
+fills all three fields stores them in the plugin's persistence storage as the default; a new
+endpoint leaves them empty and inherits automatically (per-field — a value filled on the
+endpoint overrides only that field). A partially filled endpoint is never written back, so it
+cannot poison the default. Note: endpoint settings are encrypted at rest by the daemon, but
+the default copy lives in plugin storage (plain KV, reachable only by this plugin).
+
+三个配置项支持"登记一次、处处继承"：任一 Endpoint 填全三项后自动写入插件存储作为默认值；新建
+Endpoint 留空即自动继承（按字段合并，端点自己填的字段优先覆盖）。只填一部分的端点不会被写回，
+避免污染默认值。注意：端点设置由 daemon 加密存储，而默认值副本存于插件 storage（明文 KV，仅本
+插件可读）。
+
 ### v0.2.1 changes v0.2.1 变更
 
 **Tool Metadata Resolution Fix — required setup for tool schemas 工具元数据解析修复（获取工具 Schema 的必填配置）**
@@ -54,6 +92,7 @@ original tool definition from the Dify Console API
   (same compose network)
 - `dify_console_api_key` — `secret-input`, created in Dify **Settings → API**; the daemon
   stores it encrypted. Used only for read-only schema fetches.
+- `dify_workspace_id` — team ID sent as `X-WORKSPACE-ID` (**added in 0.2.2, required**)
 
 If these are not configured or a schema cannot be fetched, the tool is **not exposed**
 (logged with a reason) instead of being advertised with a misleading empty schema.

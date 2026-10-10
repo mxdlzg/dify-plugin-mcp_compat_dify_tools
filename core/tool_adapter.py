@@ -174,12 +174,14 @@ def adapt_tool_entry(
     if not raw.get("enabled", False):
         return None
 
+    name = raw.get("tool_name") or raw.get("name")
+
     # Field-shape diagnostic for locating missing tool metadata. Emits only
     # key names and counts, never values, so credentials cannot leak.
     logger.warning(
         "TOOL_META_DIAG name=%s keys=%s schemas=%s tool_parameters=%s "
         "tool_configuration=%s settings=%s parameters=%s",
-        raw.get("tool_name"),
+        name,
         sorted(raw.keys()),
         len(raw.get("schemas") or []),
         len(raw.get("tool_parameters") or {}),
@@ -189,7 +191,6 @@ def adapt_tool_entry(
         if isinstance(raw.get("parameters"), dict) else "non-dict",
     )
 
-    name = raw.get("tool_name") or raw.get("name")
     if not name:
         logger.warning("Skipping endpoint tool entry without a tool_name")
         return None
@@ -236,8 +237,8 @@ def adapt_tool_entry(
             logger.warning(
                 "Tool '%s': no inline parameter schema and no console API "
                 "metadata configured (set dify_console_api_base/"
-                "dify_console_api_key on this endpoint); not exposing the "
-                "tool. value-only keys seen = %s",
+                "dify_console_api_key/dify_workspace_id on this endpoint); "
+                "not exposing the tool. value-only keys seen = %s",
                 name,
                 sorted(set((raw.get("parameters") or {}).keys())
                        | set(config.keys())),
