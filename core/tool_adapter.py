@@ -146,6 +146,21 @@ def adapt_tool_entry(raw: dict[str, Any]) -> AdaptedTool | None:
     if not raw.get("enabled", False):
         return None
 
+    # Field-shape diagnostic for locating missing tool metadata. Emits only
+    # key names and counts, never values, so credentials cannot leak.
+    logger.warning(
+        "TOOL_META_DIAG name=%s keys=%s schemas=%s tool_parameters=%s "
+        "tool_configuration=%s settings=%s parameters=%s",
+        raw.get("tool_name"),
+        sorted(raw.keys()),
+        len(raw.get("schemas") or []),
+        len(raw.get("tool_parameters") or {}),
+        len(raw.get("tool_configuration") or {}),
+        sorted((raw.get("settings") or {}).keys()),
+        sorted((raw.get("parameters") or {}).keys())
+        if isinstance(raw.get("parameters"), dict) else "non-dict",
+    )
+
     name = raw.get("tool_name") or raw.get("name")
     if not name:
         logger.warning("Skipping endpoint tool entry without a tool_name")
@@ -162,23 +177,41 @@ def adapt_tool_entry(raw: dict[str, Any]) -> AdaptedTool | None:
 
     selector_shape = "tool_parameters" in raw or "tool_configuration" in raw
 
-    if "schemas" in raw:
-        param_dicts = list(raw.get("schemas") or [])
+    # Pick the metadata source by which one actually carries data, not by key
+    # presence: a `schemas` key that is present but empty must not lock out the
+    # other sources (that silent-empty-schema was the original bug class).
+    schemas_value = raw.get("schemas") or []
+    tool_parameters_value = raw.get("tool_parameters") or {}
+
+    if schemas_value:
+        param_dicts = list(schemas_value)
         config = dict(raw.get("settings") or {})
+    elif tool_parameters_value:
+        param_dicts = _llm_params_to_dicts(tool_parameters_value)
+        config = dict(raw.get("tool_configuration") or raw.get("settings") or {})
     elif selector_shape:
-        param_dicts = _llm_params_to_dicts(raw.get("tool_parameters") or {})
-        config = dict(raw.get("tool_configuration") or {})
+        # selector shape present but with an empty llm map — could be a real
+        # zero-parameter tool; config still comes from tool_configuration.
+        param_dicts = []
+        config = dict(raw.get("tool_configuration") or raw.get("settings") or {})
     else:
-        # No parameter metadata at all. An empty schema is only honest for a
-        # tool that truly has no parameters; log so a silent upstream
-        # regression is visible in the daemon logs.
-        logger.warning(
-            "Tool '%s': no parameter metadata found in endpoint settings "
-            "(expected 'schemas' or 'tool_parameters'); advertising it without "
-            "parameters", name,
+        # No parameter *schema* anywhere. The Dify tool-selector may still have
+        # sent a `parameters`/`settings` *value* map (provider_name/tool_name +
+        # values only, no type/required/description). Those keys are NOT a
+        # schema and must not be guessed into one (taskbook: forbidden to infer
+        # type/required from `parameters` keys). Treat as metadata-missing.
+        value_only_keys = sorted(
+            set((raw.get("parameters") or {}).keys())
+            | set((raw.get("settings") or {}).keys())
         )
         param_dicts = []
-        config = {}
+        config = dict(raw.get("settings") or {})
+        logger.warning(
+            "Tool '%s': no parameter schema in endpoint settings "
+            "(looked for 'schemas' / 'tool_parameters'); value-only keys seen "
+            "= %s. Advertising without schema until a metadata source is wired.",
+            name, value_only_keys,
+        )
 
     input_schema, skipped = build_input_schema(param_dicts, pinned=config.keys())
     meta = _collect_schema_meta(param_dicts)

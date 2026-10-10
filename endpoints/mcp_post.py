@@ -6,6 +6,7 @@ from dify_plugin import Endpoint
 from werkzeug import Request, Response
 
 from core.mcp_handler import dispatch
+from core.server_info import SERVER_NAME, SERVER_VERSION
 from core.tool_adapter import AdaptedTool
 
 
@@ -33,8 +34,8 @@ class McpPostEndpoint(Endpoint):
                         "tools": {},
                     },
                     "serverInfo": {
-                        "name": "MCP Compatible Dify Tools",
-                        "version": "1.0.0"
+                        "name": SERVER_NAME,
+                        "version": SERVER_VERSION
                     },
                 },
             }

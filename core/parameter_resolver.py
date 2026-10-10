@@ -31,12 +31,33 @@ _DYNAMIC_TYPES: frozenset[str] = frozenset({
     "template",
 })
 
+# Expression types Dify's value-selector actually emits. Used to decide
+# whether a single-key {"value": ...} dict is a wrapper or a legitimate
+# business object ({"value": ..., "type": "money"} must never be unwrapped).
+_KNOWN_EXPRESSION_TYPES: frozenset[str] = frozenset({"constant"}) | _DYNAMIC_TYPES
+
 
 def _is_expression_dict(value: Any) -> bool:
     return (
         isinstance(value, dict)
-        and "type" in value
-        and isinstance(value.get("type"), str)
+        and value.get("type") in _KNOWN_EXPRESSION_TYPES
+    )
+
+
+def _is_wrapped_expression(value: Any) -> bool:
+    """True for the single-key wrapper Dify's getStructureValue() produces:
+
+    ``{"value": {"type": "constant", "value": "false"}}``
+
+    Deliberately narrow: exactly one ``value`` key whose content is itself an
+    expression dict. A business object that carries ``value`` alongside other
+    keys is not a wrapper (principle 4).
+    """
+
+    return (
+        isinstance(value, dict)
+        and set(value.keys()) == {"value"}
+        and _is_expression_dict(value["value"])
     )
 
 
@@ -50,7 +71,18 @@ def resolve_config_value(value: Any) -> Any:
 
     # Bounded unwrap depth guards against a pathological self-referencing dict.
     depth = 0
-    while _is_expression_dict(value) and depth < 32:
+    while depth < 32:
+        # Dify's getStructureValue() wraps each settings entry as
+        # {"value": {"type": "constant", "value": ...}}; peel the wrapper
+        # before the expression itself is handled.
+        if _is_wrapped_expression(value):
+            value = value["value"]
+            depth += 1
+            continue
+
+        if not _is_expression_dict(value):
+            return value
+
         expr_type = value["type"]
         if expr_type in _DYNAMIC_TYPES:
             raise UnresolvedParameterError(

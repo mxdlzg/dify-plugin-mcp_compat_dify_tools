@@ -119,6 +119,42 @@ def test_dynamic_expression_raises():
             pass
 
 
+# --- Dify getStructureValue() double wrapper (real Endpoint settings shape) ---
+
+def test_settings_double_wrapper_constant():
+    # Real shape saved by the Dify tool selector for form/settings values.
+    wrapped = {"value": {"type": "constant", "value": "false"}}
+    resolved = resolve_config_value(wrapped)
+    assert resolved == "false"
+    assert isinstance(resolved, str)
+
+
+def test_settings_double_wrapper_number_and_bool():
+    assert resolve_config_value({"value": {"type": "constant", "value": 3}}) == 3
+    assert resolve_config_value({"value": {"type": "constant", "value": False}}) is False
+
+
+def test_settings_double_wrapper_dynamic_raises():
+    wrapped = {"value": {"type": "variable", "value": ["node", "x"]}}
+    try:
+        resolve_config_value(wrapped)
+        assert False, "variable inside wrapper should raise"
+    except UnresolvedParameterError:
+        pass
+
+
+def test_business_dict_with_type_key_not_unwrapped():
+    # A legitimate object carrying a non-expression "type" must survive.
+    obj = {"value": "100", "type": "currency"}
+    assert resolve_config_value(obj) is obj
+
+
+def test_business_dict_single_value_key_not_unwrapped():
+    # {"value": <non-expression>} is not a wrapper.
+    obj = {"value": {"amount": 5, "unit": "USD"}}
+    assert resolve_config_value(obj) is obj
+
+
 # --- required only references visible properties ---
 
 def test_required_subset_of_properties():
