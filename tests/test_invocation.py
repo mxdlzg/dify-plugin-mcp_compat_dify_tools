@@ -4,6 +4,7 @@ import pytest
 
 from core.mcp_handler import dispatch, rpc_error
 from core.tool_adapter import (
+    ToolConfigError,
     ToolValidationError,
     adapt_tool_entry,
     adapt_tools,
@@ -12,6 +13,7 @@ from core.tool_adapter import (
 )
 
 from fixtures import (
+    form_mixed_tool,
     no_llm_tool,
     number_bool_tool,
     object_array_tool,
@@ -158,3 +160,65 @@ def test_runtime_exception_is_masked(fake_invoke):
 def test_unsupported_method_returns_protocol_error():
     resp = dispatch("resources/list", 5, {}, {"tools": []}, lambda t, p: [])
     assert resp["error"]["code"] == -32601
+
+
+# --- Dify 1.17.1 `mixed` server-config values (Tavily project_id scenario) ---
+
+def test_mixed_fixed_text_is_sent_as_string():
+    tool = adapt_tool_entry(form_mixed_tool("proj-123"))
+    merged = prepare_invoke_parameters(tool, {"query": "hi"})
+    assert merged == {"query": "hi", "project_id": "proj-123"}
+
+
+def test_mixed_empty_string_is_sent_unchanged():
+    # "" is a real configured value distinct from null; it must be sent.
+    tool = adapt_tool_entry(form_mixed_tool(""))
+    merged = prepare_invoke_parameters(tool, {"query": "hi"})
+    assert merged["project_id"] == ""
+
+
+def test_mixed_null_optional_param_is_omitted():
+    # Tavily project_id left empty arrives as mixed-null: omit the key so the
+    # tool applies its own default instead of receiving a literal null.
+    tool = adapt_tool_entry(form_mixed_tool(None))
+    merged = prepare_invoke_parameters(tool, {"query": "hi"})
+    assert merged == {"query": "hi"}
+
+
+def test_mixed_variable_reference_raises_config_error():
+    tool = adapt_tool_entry(form_mixed_tool("{{#sys.query#}}"))
+    with pytest.raises(ToolConfigError, match="cannot be resolved"):
+        prepare_invoke_parameters(tool, {"query": "hi"})
+
+
+def test_required_form_param_with_null_config_raises():
+    tool = adapt_tool_entry(form_mixed_tool(None, required=True))
+    with pytest.raises(ToolConfigError, match="required parameter 'project_id'"):
+        prepare_invoke_parameters(tool, {"query": "hi"})
+
+
+def test_required_form_param_never_configured_raises():
+    tool = adapt_tool_entry(form_mixed_tool(None, required=True, raw_settings={}))
+    with pytest.raises(ToolConfigError, match="not configured"):
+        prepare_invoke_parameters(tool, {"query": "hi"})
+
+
+def test_falsy_server_values_survive_the_merge():
+    # 0 / False / "" are real values: never treated as "not configured".
+    settings = {
+        "project_id": {"type": "mixed", "value": ""},
+        "max_results": {"type": "constant", "value": 0},
+        "notify": {"type": "constant", "value": False},
+    }
+    tool = adapt_tool_entry(form_mixed_tool(None, raw_settings=settings))
+    merged = prepare_invoke_parameters(tool, {"query": "hi"})
+    assert merged["project_id"] == ""
+    assert merged["max_results"] == 0
+    assert merged["notify"] is False
+
+
+def test_client_still_cannot_override_mixed_form_param():
+    # The None-omission path must not open a client override for form params.
+    tool = adapt_tool_entry(form_mixed_tool(None))
+    with pytest.raises(ToolValidationError, match="fixed server-side configuration"):
+        prepare_invoke_parameters(tool, {"query": "hi", "project_id": "hack"})

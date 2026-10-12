@@ -56,6 +56,9 @@ class AdaptedTool:
     param_types: dict[str, str] = field(default_factory=dict)
     # raw server-side config (name -> expression), resolved lazily per call
     raw_config: dict[str, Any] = field(default_factory=dict)
+    # non-llm parameters the declaration marks required: a null/missing
+    # configured value is a configuration error, never a silent omission
+    required_server_params: set[str] = field(default_factory=set)
     # config keys that belong to non-llm params: never overridable by client
     protected_config_keys: set[str] = field(default_factory=set)
     # non-llm parameter names that must not be advertised in the schema
@@ -115,6 +118,7 @@ def _collect_schema_meta(params: list[dict[str, Any]]) -> dict[str, Any]:
     types: dict[str, str] = {}
     llm_names: set[str] = set()
     server_names: set[str] = set()
+    required_server: set[str] = set()
     for p in params:
         name = p.get("name")
         if not name:
@@ -128,11 +132,14 @@ def _collect_schema_meta(params: list[dict[str, Any]]) -> dict[str, Any]:
                 ]
         else:
             server_names.add(name)
+            if p.get("required"):
+                required_server.add(name)
     return {
         "enums": enums,
         "types": types,
         "llm_names": llm_names,
         "server_names": server_names,
+        "required_server": required_server,
     }
 
 
@@ -306,6 +313,7 @@ def adapt_tool_entry(
         enum_params=meta["enums"],
         param_types=meta["types"],
         raw_config=config,
+        required_server_params=meta["required_server"],
         protected_config_keys=protected,
         server_param_names=meta["server_names"],
         unsupported_params=skipped,
@@ -414,8 +422,13 @@ def prepare_invoke_parameters(
       did not pin); anything else -> ToolValidationError
     - missing required params -> ToolValidationError
     - every server-configured value (pinned llm params + form/schema params)
-      is resolved here and always sent; values keep their Dify types, so a
+      is resolved here and always wins; values keep their Dify types, so a
       select ``"false"`` stays the string ``"false"`` (root cause B)
+    - a resolved server value of ``None`` is OMITTED (Dify "not configured"
+      semantics, e.g. an empty optional text-input) — falsy-but-real values
+      like ``False``/``0``/``""`` are still sent (never ``if not value``)
+    - a parameter the declaration marks required whose configured value is
+      None/missing -> ToolConfigError (never silently dropped)
     """
 
     if not isinstance(client_args, dict):
@@ -446,11 +459,40 @@ def prepare_invoke_parameters(
         for name, value in client_args.items()
     }
 
-    # Every server-configured value is resolved and always wins.
+    # Every server-configured value is resolved and always wins over anything
+    # the client sent (defense in depth; client keys are already restricted).
     server_values = _resolve_server_values(tool, sorted(tool.raw_config.keys()))
 
     merged: dict[str, Any] = dict(validated)
-    merged.update(server_values)
+    for key, resolved in server_values.items():
+        if resolved is None:
+            # Dify stores "not configured" as null (e.g. an empty optional
+            # text-input / secret-input). Omit it so the tool applies its own
+            # default instead of receiving a literal null.
+            if key in tool.required_server_params:
+                raise ToolConfigError(
+                    f"tool '{tool.name}': required parameter '{key}' has no "
+                    "configured value on this endpoint; configure it or make "
+                    "it agent-provided"
+                )
+            logger.info(
+                "Tool '%s': omitting server parameter '%s' (resolved to null; "
+                "treated as not configured)",
+                tool.name, key,
+            )
+            continue
+        merged[key] = resolved
+
+    # A required server parameter the endpoint never configured at all.
+    unconfigured_required = [
+        key for key in sorted(tool.required_server_params)
+        if key not in merged
+    ]
+    if unconfigured_required:
+        raise ToolConfigError(
+            f"tool '{tool.name}': required parameter(s) not configured on this "
+            f"endpoint: {', '.join(unconfigured_required)}"
+        )
     return merged
 
 

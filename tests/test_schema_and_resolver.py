@@ -119,6 +119,64 @@ def test_dynamic_expression_raises():
             pass
 
 
+# --- Dify 1.17.1 `mixed` semantics ---
+# The frontend stores EVERY text-input/secret-input as
+# {"type": "mixed", "value": ...}, whether or not the text references a
+# workflow variable. Only a real {{#...#}} reference needs workflow context.
+
+def test_mixed_fixed_text_resolves_to_literal():
+    assert resolve_config_value({"type": "mixed", "value": "proj-123"}) == "proj-123"
+
+
+def test_mixed_empty_string_is_preserved_as_empty():
+    # "" is a real configured value, distinct from null ("not configured").
+    resolved = resolve_config_value({"type": "mixed", "value": ""})
+    assert resolved == ""
+    assert isinstance(resolved, str)
+
+
+def test_mixed_null_resolves_to_none():
+    assert resolve_config_value({"type": "mixed", "value": None}) is None
+
+
+def test_mixed_sys_query_reference_raises():
+    for ref in ("{{#sys.query#}}", "prefix {{#1711528712102.text#}} suffix"):
+        try:
+            resolve_config_value({"type": "mixed", "value": ref})
+            assert False, f"variable reference should raise: {ref}"
+        except UnresolvedParameterError:
+            pass
+
+
+def test_mixed_double_wrapper_resolves_through_wrapper():
+    # Real getStructureValue() shape for a text-input left with fixed text.
+    wrapped = {"value": {"type": "mixed", "value": "fixed text"}}
+    assert resolve_config_value(wrapped) == "fixed text"
+    # ...and the wrapped form with a variable reference still raises.
+    try:
+        resolve_config_value({"value": {"type": "mixed", "value": "{{#node.x#}}"}})
+        assert False, "wrapped mixed reference should raise"
+    except UnresolvedParameterError:
+        pass
+
+
+def test_constant_zero_and_false_keep_their_types():
+    zero = resolve_config_value({"type": "constant", "value": 0})
+    assert zero == 0
+    assert isinstance(zero, int)
+    assert zero is not False
+    false = resolve_config_value({"type": "constant", "value": False})
+    assert false is False
+
+
+def test_references_variable_walks_containers():
+    from core.parameter_resolver import references_variable
+
+    assert references_variable({"a": ["{{#node.f#}}"]}) is True
+    assert references_variable({"a": ["plain"]}) is False
+    assert references_variable(5) is False
+
+
 # --- Dify getStructureValue() double wrapper (real Endpoint settings shape) ---
 
 def test_settings_double_wrapper_constant():

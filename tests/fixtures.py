@@ -176,6 +176,49 @@ def no_llm_tool():
     }
 
 
+# Dify 1.17.1 stores text-input/secret-input form values as type="mixed"
+# (double-wrapped by getStructureValue()). project_id is an OPTIONAL form
+# param exactly like Tavily's "Project ID" text-input that triggered the
+# production "dynamic expression type 'mixed'" failure. Schemas-shape is used
+# because the selector-shape tool_parameters map only ever carries llm params.
+def form_mixed_tool(project_id_value, *, required=False, raw_settings=None):
+    if raw_settings is None:
+        raw_settings = {
+            "project_id": {"value": {"type": "mixed", "value": project_id_value}}
+        }
+    return {
+        "enabled": True,
+        "type": "builtin",
+        "provider_name": "p",
+        "tool_name": "search_ctx",
+        "tool_label": "Search Ctx",
+        "schemas": [
+            {
+                "name": "query",
+                "type": "string",
+                "form": "llm",
+                "required": True,
+                "llm_description": "Query string",
+            },
+            {
+                "name": "project_id",
+                "type": "string",
+                "form": "form",
+                "required": required,
+                "llm_description": "Tavily project id",
+            },
+            {
+                "name": "max_results",
+                "type": "number",
+                "form": "form",
+                "required": False,
+                "llm_description": "Max results",
+            },
+        ],
+        "settings": raw_settings,
+    }
+
+
 class FakeToolInvocation:
     """Stand-in for ``self.session.tool.invoke`` capturing sent parameters."""
 
