@@ -13,18 +13,68 @@ from dify_plugin.entities.tool import ToolParameter
 
 _T = ToolParameter.ToolParameterType
 
-# Types MCP cannot represent as a value an agent can fill in. Reported, never
-# silently passed through as an illegal JSON-Schema ``type`` (root cause C).
-UNSUPPORTED_TYPES: frozenset[str] = frozenset({
-    _T.FILE.value,
-    _T.FILES.value,
-})
+# No MCP-representable contract yet: system-files semantics depend on the
+# workflow context an endpoint never has, so it stays reported, never guessed.
+# (Dify declares it in tool YAML; the plugin SDK enum has no member for it,
+# hence the literal.) file/files ARE advertised (see FILE_INPUT_REF) but must
+# be converted by core.file_adapter before invoke — advertising without
+# conversion is the exact failure mode the taskbook forbids.
+UNSUPPORTED_TYPES: frozenset[str] = frozenset({"system-files"})
 
 _S, _N, _B, _O, _A = "string", "number", "boolean", "object", "array"
+
+# JSON-Schema location of the shared file-object contract. A file parameter
+# references it via allOf so a per-parameter description can sit beside it.
+FILE_INPUT_REF = "#/$defs/fileInput"
 
 
 def is_unsupported_type(param_type: str) -> bool:
     return param_type in UNSUPPORTED_TYPES
+
+
+def build_file_input_def(max_bytes_hint: int | None = None) -> dict[str, Any]:
+    """The contract every MCP client must satisfy for a Dify file parameter.
+
+    Exactly one of two shapes: inline base64 bytes, or an http(s) URL the
+    gateway is allowed to fetch (URL fetching is admin-gated, see file_adapter).
+    A Dify file-id reference is deliberately NOT accepted: an endpoint cannot
+    verify that an arbitrary id belongs to this workspace/caller, and passing
+    unverified ids through would let one caller read another's files.
+    """
+    size_note = f" (max {max_bytes_hint} bytes)" if max_bytes_hint else ""
+    return {
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "source": {"const": "base64"},
+                    "filename": {"type": "string", "minLength": 1},
+                    "mimeType": {
+                        "type": "string",
+                        "description": "e.g. application/pdf; sniffed from content if omitted",
+                    },
+                    "data": {
+                        "type": "string",
+                        "description": f"Standard base64 of the file content{size_note}, no data-URL prefix",
+                    },
+                },
+                "required": ["source", "filename", "data"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "source": {"const": "url"},
+                    "url": {"type": "string", "pattern": "^https?://"},
+                    "filename": {"type": "string", "minLength": 1},
+                    "mimeType": {"type": "string"},
+                },
+                "required": ["source", "url"],
+                "additionalProperties": False,
+            },
+        ],
+    }
 
 
 def _flatten_description(value: Any) -> str:
@@ -67,6 +117,12 @@ def build_property_schema(
             schema = {"type": _S}
             if enum:
                 schema["enum"] = enum
+    elif param_type == _T.FILE.value:
+        # allOf keeps the per-parameter description next to the shared $ref
+        # (a bare $ref sibling would be ignored by strict validators).
+        schema = {"allOf": [{"$ref": FILE_INPUT_REF}]}
+    elif param_type == _T.FILES.value:
+        schema = {"type": _A, "items": {"$ref": FILE_INPUT_REF}}
     elif param_type == _T.DYNAMIC_SELECT.value:
         # Options resolve at runtime by Dify; expose a free-form string.
         schema = {"type": _S}
@@ -121,6 +177,7 @@ def build_input_schema(
     properties: dict[str, Any] = {}
     required: list[str] = []
     skipped: list[str] = []
+    uses_file_ref = False
     pinned = pinned or set()
 
     for param in parameters:
@@ -145,9 +202,24 @@ def build_input_schema(
             input_schema=param.get("input_schema"),
             multiple=bool(param.get("multiple")),
         )
+        if ptype in (_T.FILE.value, _T.FILES.value):
+            uses_file_ref = True
+            # A required multi-file param must carry at least one file; an
+            # optional one may legitimately be an empty list.
+            if ptype == _T.FILES.value and param.get("required"):
+                properties[name]["minItems"] = 1
         if param.get("required"):
             required.append(name)
 
     # required must only reference keys present in properties.
     required = [r for r in required if r in properties]
-    return {"type": "object", "properties": properties, "required": required}, skipped
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    }
+    # Emit the shared contract ONLY when it is referenced, so non-file tools
+    # keep the byte-identical schema they had before file support (G5).
+    if uses_file_ref:
+        schema["$defs"] = {"fileInput": build_file_input_def()}
+    return schema, skipped

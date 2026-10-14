@@ -48,6 +48,12 @@ invokes the tool), and builds honest MCP tools on top of it.
   MCP client; pinned values are merged into every call with their original Dify types (a select
   `"false"` stays the string `"false"`). 端点中固定的参数、凭据类 `form` 参数不出现在 Schema、
   不可被客户端覆盖，调用时按原始类型自动合并。
+- **File input & multimodal output 文件输入与多模态输出** — any tool declaring a Dify `file`/`files`
+  parameter is discoverable and callable: send base64 (or an allow-listed URL), the gateway uploads
+  it through Dify's own file pipeline and hands the tool a real Dify file object. Image/blob/JSON
+  tool results come back as proper MCP content blocks instead of a text placeholder.
+  任何声明 `file`/`files` 参数的 Dify 工具都能被发现和调用；图片/文件/JSON 结果按 MCP content
+  block 返回，不再压平成文字。
 - **Display metadata 显示元数据** — MCP `title` plus `icons` (light/dark, official MCP ≥
   2025-09-24) taken from Dify provider metadata (full URLs).
 - **Configure once 一次配置，处处继承** — the three console settings are auto-registered into
@@ -160,10 +166,81 @@ A `tools/list` entry now looks like:
 | date | `string` + `format: date` |
 | date-range | `object {start, end}` |
 | object / array | `object` / `array`（有嵌套元数据时保留） |
+| **file** | `$ref: #/$defs/fileInput`（`allOf` 包裹以保留描述） |
+| **files** | `array` of `$ref: #/$defs/fileInput`；仅必填时 `minItems: 1` |
+| system-files | 不支持，记录日志（语义依赖 workflow 上下文，端点拿不到） |
 
 Advanced compatibility note: endpoint entries that inline a full `schemas` list or a
 `tool_parameters` map (SDK `ToolSelector` shape) are still honored — useful for fixtures.
 内联 `schemas` / `tool_parameters` 的旧数据结构仍然支持（高级用法）。
+
+---
+
+## File input 文件输入
+
+工具声明的 `type: file` / `type: files`（`form: llm`）会真实出现在 `tools/list` 里，必填/可选语义
+保留。`form: form` 的文件参数属于服务端配置，依旧不暴露、不可被客户端覆盖。
+
+客户端必须按下面两种形态之一传值（schema 里的 `$defs.fileInput`，`oneOf` + `additionalProperties: false`）：
+
+```jsonc
+// 1) 内联 base64（推荐，默认唯一可用方式）
+{
+  "file": {
+    "source": "base64",
+    "filename": "report.pdf",
+    "mimeType": "application/pdf",   // 可省略，网关按文件头嗅探
+    "data": "JVBERi0xLjQK..."        // 纯 base64，也容忍 data:URL 前缀
+  }
+}
+
+// 2) URL（默认关闭，需管理员开开关 + 配白名单）
+{ "file": { "source": "url", "url": "https://files.example.com/report.pdf" } }
+
+// 多文件参数（files）就是上面的数组，顺序与数量都会保留
+{ "files": [ { "source": "base64", "filename": "a.txt", "data": "..." }, ... ] }
+```
+
+网关会把文件经 **Dify 官方上传链路**（`session.file.upload` → 签名 URL）转换成工具真正认识的
+Dify 文件对象再下发，客户端的包装对象不会泄漏给下游；同一次调用内相同文件只上传一次。
+
+**`source: "dify_file"` 明确不支持**：端点插件无法验证客户端给的 file id 是否属于本工作区，
+透传会造成跨工作区读文件，所以直接拒绝而不是猜测。
+
+### File settings 文件相关配置（端点设置，均可留空取默认）
+
+| 设置项 | 默认 | 说明 |
+|---|---|---|
+| `file_max_bytes` | 5 MiB | 单文件上限（daemon 自身硬上限 15 MiB，超出会被收敛） |
+| `file_max_count` | 5 | 单次调用最多文件数 |
+| `file_max_total_bytes` | 10 MiB | 单次调用文件总量 |
+| `file_url_enabled` | `false` | 是否允许 URL 形态输入 |
+| `file_url_allow_hosts` | 空 | 可信域名白名单（含子域名）；未开启开关时不生效 |
+| `file_url_allow_private` | `false` | 是否允许白名单域名解析到 RFC1918（内网文件服务器）；环回/链路本地/云元数据 IP 无论如何都拒绝 |
+| `file_url_timeout_seconds` | 30 | URL 下载超时 |
+
+URL 输入的安全边界：只允许 http(s)、只下载白名单域名、**发起请求前**先解析 DNS 并拒绝私网/环回/
+链路本地/组播/保留地址（含 `169.254.169.254`）、每一跳重定向都重新校验、流式下载并限长、错误信息
+不含 URL 与凭据。仍存在的已知残余风险：DNS 复核到实际连接之间有极窄的 TOCTOU 窗口——这正是 URL
+默认关闭的原因。
+
+---
+
+## Tool output 工具输出
+
+`tools/call` 返回结构化 MCP content block，顺序与 Dify 消息流一致：
+
+| Dify 消息 | MCP 输出 |
+|---|---|
+| TEXT | `text` |
+| JSON | `text`（裸 JSON 字符串，客户端可直接 parse；不再加 `tool response:` 前缀） |
+| IMAGE / BLOB | 内联 base64 `image` 块，仅限 `image/*` 且 ≤3 MiB；非图片二进制或超限时给出明确文字说明，而不是伪造 `image` 块或静默截断 |
+| BLOB_CHUNK | 按 `id`+`sequence` 聚合后同上 |
+| IMAGE_LINK / FILE | 可访问 URL 的文本说明（`resource_link` 属于 2025-03-26 协议，本网关声明 2024-11-05，不产出客户端可能拒绝的块） |
+| LINK | `text`（result link: …） |
+| VARIABLE / RETRIEVER_RESOURCES | `text`（JSON 序列化保留） |
+| LOG | 不返回（执行遥测，可能含内部信息），仅 debug 日志 |
+| 未知类型 | 记 warning + 安全文字降级，绝不 `repr()` 内部对象 |
 
 ---
 
@@ -173,15 +250,31 @@ Advanced compatibility note: endpoint entries that inline a full `schemas` list 
   `builtin/` route). Custom **API / workflow / app** tools need an inline `schemas` fixture for
   now, otherwise they are not exposed. 自动解析目前覆盖内置/市场插件工具；自定义 API/工作流工具
   需要内联 `schemas`，否则不上架。
-- `file`/`files` parameters are dropped from schemas (logged); image/file tool outputs return a
-  text placeholder; `variable`/`mixed` dynamic config expressions are rejected at call time.
-  文件类参数、图片/文件输出、动态变量表达式暂不支持。
-- Endpoints have **no authentication / Origin validation** (inherited upstream): deploy on a
-  trusted network or put an authenticating reverse proxy in front. 端点无鉴权（沿袭上游），请部署
-  在可信网络或加反代鉴权。
+- `variable`-type config expressions (workflow variable references) are still rejected at call
+  time; `mixed` fixed text is resolved, real `{{#…#}}` references are not guessed.
+  `variable` 动态表达式仍拒绝；`mixed` 固定文本已支持。
+- `source: "dify_file"`（引用已上传文件 id）不支持：端点无法验证该 id 属于本工作区，透传有跨工作区
+  读取风险。文件请直接用 base64 传入。
+- Inline binary output is capped (default 3 MiB): an oversized `IMAGE`/`BLOB` is reported as text
+  rather than truncated, because Dify gives no downloadable URL for inline blobs. Non-image inline
+  bytes (`application/pdf`…) are also reported as text — `2024-11-05` has no block for them, so
+  emitting an `image` block would be a lie the client cannot render.
+  内联二进制超限时会明确提示，不会静默截断；非图片的内联字节同样只给文字说明，不会伪装成 `image` 块。
+- File input works at protocol `2024-11-05` (base64 lives in `arguments`). `resource_link` output
+  blocks would need `2025-03-26`+; upgrading the negotiated version is a separate task.
+  文件输入无需改协议；`resource_link` 等输出块需更高协议版本，留作后续。
+- Endpoints have **no authentication / Origin validation** (inherited upstream). **File input makes
+  this materially more dangerous**: an open endpoint lets anyone upload to your Dify file storage
+  (and, if enabled, make the gateway fetch URLs). Do not expose the endpoint without an
+  authenticating reverse proxy + HTTPS.
+  端点无鉴权（沿袭上游）。加入文件输入后风险显著上升：公网裸奔等于任何人都能往你的 Dify 文件存储
+  上传文件（开启 URL 后还能让网关去请求地址）。对外暴露必须加反代鉴权 + HTTPS。
 - The auto-registered default config lives in plugin storage (plain KV, readable only by this
   plugin itself); the endpoint's own copy of the key stays daemon-encrypted.
 - Provider metadata is cached 300s per base+workspace; icon/label changes need up to 5 minutes.
+- Dify signs file URLs with a 300s expiry (`FILES_ACCESS_TIMEOUT`); a tool that lazily reads the
+  file long after the call may find the URL expired. Raise it in Dify if needed.
+  Dify 文件 URL 签名 300 秒过期，工具若延迟读取可能失效。
 
 ## FAQ
 
@@ -200,6 +293,22 @@ The mirror is serving a partial package index; restart the plugin daemon contain
 negative cache) or set `UV_DEFAULT_INDEX=https://pypi.org/simple` on the daemon. 镜像源同步延迟，
 重启 plugin_daemon 容器，或给 daemon 配置 `UV_DEFAULT_INDEX`。
 
+**Q: 怎么用一条 curl 验证文件输入链路？**
+Base64 a file and post it as a `fileInput` object — extracted text in the response is the proof the
+file reached the tool runtime (a raw wrapper would fail parameter validation instead).
+
+```bash
+B64=$(base64 -w0 report.pdf)
+curl -sS -X POST http://<host>:18080/e/<endpoint-id>/mcp \
+  -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"dify_extractor\",\"arguments\":{\"file\":{\"source\":\"base64\",\"filename\":\"report.pdf\",\"mimeType\":\"application/pdf\",\"data\":\"$B64\"}}}}"
+```
+
+**Q: 报 "uploading ... to Dify failed" / 文件上传失败？**
+文件上传要经 Dify 的文件网关并回一个签名 URL（`FILES_URL` + `FILES_ACCESS_TIMEOUT`，默认 300s）。
+如果 Dify 侧 `FILES_URL` 未配置或插件容器访问不到它，就没有可用 URL —— 网关会明确报
+"no file URL"，而不是把无法访问的链接发给工具。
+
 ## Development 本地开发
 
 ```bash
@@ -212,8 +321,14 @@ python -m venv .venv
 `core/` holds the transport-independent logic (adapter, schema converter, parameter resolver,
 console metadata, global config); `endpoints/` are thin per-transport shells.
 
-## Changelog 变更记录（0.2.x）
+## Changelog 变更记录
 
+- **0.3.0** — Generic file support: `file`/`files` parameters are advertised with a validated
+  `fileInput` contract (`$defs`, `oneOf` base64/url, `minItems` only when required) and converted
+  through Dify's upload pipeline into real Dify file parameters (`core/file_adapter.py`). URL input
+  is opt-in with host allow-listing + pre-request private-IP/SSRF rejection. Tool results become
+  structured MCP content blocks (text/image/reassembled blob chunks), mixed types keep order.
+  通用文件输入（base64/白名单 URL，走 Dify 官方上传链路）与多模态输出（结构化 content block）。
 - **0.2.3** — MCP display metadata: `title` + light/dark `icons` from the Console provider
   list (full URLs). 显示元数据（title + 明暗图标）。
 - **0.2.2** — Console auth corrected (`Authorization: Bearer` + `X-WORKSPACE-ID`, new

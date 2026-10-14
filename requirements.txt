@@ -1,1 +1,4 @@
 dify_plugin>=0.10.2,<0.11.0
+# Imported directly by core/file_adapter.py (URL file input). Also a transitive
+# dependency of dify_plugin, so this adds no new package to the install.
+httpx>=0.28.1

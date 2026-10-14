@@ -32,6 +32,93 @@ settings:
     help:
       en_US: "Sent as the X-WORKSPACE-ID header when fetching tool schemas (the console API always requires it). Get it from your workspace settings, e.g. c4ae3307-d5b5-4e0d-acf6-9f82e4a2559d. Leave empty to inherit the registered default."
       zh_Hans: "获取工具 Schema 时作为 X-WORKSPACE-ID 请求头发送（Console API 必需）。在团队设置中查看，例如 c4ae3307-d5b5-4e0d-acf6-9f82e4a2559d。留空则自动继承已登记的默认值。"
+  - name: file_max_bytes
+    type: text-input
+    required: false
+    default: "5242880"
+    label:
+      en_US: Max bytes per input file
+      zh_Hans: 单个输入文件上限（字节）
+    help:
+      en_US: "A number, in bytes. Hard cap for one MCP file argument. The plugin daemon itself rejects files above 15 MiB, so larger values are clamped. Defaults to 5 MiB (5242880)."
+      zh_Hans: "填写数字（字节）。单个 MCP 文件参数的硬上限。插件守护进程自身拒绝 15 MiB 以上的文件，超过该值会被收敛。默认 5 MiB（5242880）。"
+  - name: file_max_count
+    type: text-input
+    required: false
+    default: "5"
+    label:
+      en_US: Max files per tool call
+      zh_Hans: 单次调用最多文件数
+    help:
+      en_US: "A number, 1-50. Defaults to 5."
+      zh_Hans: "填写数字，范围 1-50。默认 5。"
+  - name: file_max_total_bytes
+    type: text-input
+    required: false
+    default: "10485760"
+    label:
+      en_US: Max total file bytes per tool call
+      zh_Hans: 单次调用文件总量上限（字节）
+    help:
+      en_US: "A number, in bytes. Defaults to 10 MiB (10485760)."
+      zh_Hans: "填写数字（字节）。默认 10 MiB（10485760）。"
+  - name: file_url_enabled
+    type: select
+    required: false
+    default: "false"
+    options:
+      - value: "false"
+        label:
+          en_US: Disabled (base64 only)
+          zh_Hans: 关闭（仅接受 base64）
+      - value: "true"
+        label:
+          en_US: Enabled (requires allowed hosts)
+          zh_Hans: 开启（需配置可信域名）
+    label:
+      en_US: Allow fetching input files from a URL
+      zh_Hans: 允许通过 URL 获取输入文件
+    help:
+      en_US: "OFF by default. When on, the gateway downloads file URLs, so treat it as an outbound-request capability: only hosts listed in the allowed-hosts field are fetched, private/loopback/link-local addresses and cloud metadata IPs are always refused, and redirects are re-validated. Leaving this off means clients must send base64."
+      zh_Hans: "默认关闭。开启后网关会主动下载 URL，属于对外发起请求的能力：仅下载白名单内的域名，私网/环回/链路本地地址与云元数据 IP 一律拒绝，重定向会重新校验。关闭时客户端只能发送 base64。"
+  - name: file_url_allow_hosts
+    type: text-input
+    required: false
+    label:
+      en_US: Trusted hosts for URL file input (comma separated)
+      zh_Hans: URL 文件输入的可信域名（逗号分隔）
+    help:
+      en_US: "e.g. files.example.com,cdn.example.com. Subdomains of a listed host are trusted. Has no effect unless URL input is enabled above. Allow-listed hosts may be internal on purpose."
+      zh_Hans: "例如 files.example.com,cdn.example.com；列表内域名的子域名同样可信。未开启上面的开关时不生效。白名单域名可以是内网地址（由管理员显式信任）。"
+  - name: file_url_allow_private
+    type: select
+    required: false
+    default: "false"
+    options:
+      - value: "false"
+        label:
+          en_US: Refuse private ranges (recommended)
+          zh_Hans: 拒绝私网地址（推荐）
+      - value: "true"
+        label:
+          en_US: Allow private ranges for allow-listed hosts
+          zh_Hans: 允许白名单域名解析到私网
+    label:
+      en_US: Allow an allow-listed host to resolve to a private address
+      zh_Hans: 允许白名单域名解析到私网地址
+    help:
+      en_US: "Only affects RFC1918/ULA ranges, and only for hosts already in the trusted-host list (e.g. a file server on the LAN). Loopback and link-local addresses — including the cloud metadata IP 169.254.169.254 — are refused either way. Enable only if you understand what resolves to your listed domains."
+      zh_Hans: "只影响已在可信域名列表内的域名，用于指向内网文件服务器等场景。环回与链路本地地址（含云元数据 IP 169.254.169.254）无论如何都拒绝。只有确认白名单域名解析结果可控时才开启。"
+  - name: file_url_timeout_seconds
+    type: text-input
+    required: false
+    default: "30"
+    label:
+      en_US: URL download timeout (seconds)
+      zh_Hans: URL 下载超时（秒）
+    help:
+      en_US: "A number, 1-300. Defaults to 30."
+      zh_Hans: "填写数字，范围 1-300。默认 30。"
 endpoints:
   - endpoints/sse.yaml
   - endpoints/messages.yaml

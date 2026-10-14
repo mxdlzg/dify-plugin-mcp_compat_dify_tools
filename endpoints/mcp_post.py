@@ -57,6 +57,7 @@ class McpPostEndpoint(Endpoint):
             data.get("params") or {},
             resolve_settings(settings, self.session.storage),
             self._invoke_tool,
+            self.session.file.upload,
         )
         return Response(
             json.dumps(response), status=200, content_type="application/json"

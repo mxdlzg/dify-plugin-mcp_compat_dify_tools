@@ -11,10 +11,13 @@ The adapter is pure logic over plain dicts — the endpoint keeps ownership of
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import mimetypes
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from dify_plugin.entities.tool import ToolInvokeMessage, ToolProviderType
 
@@ -59,6 +62,10 @@ class AdaptedTool:
     # non-llm parameters the declaration marks required: a null/missing
     # configured value is a configuration error, never a silent omission
     required_server_params: set[str] = field(default_factory=set)
+    # llm params declared Dify `file` / `files`: their MCP payload is a file
+    # object that must be converted before invoke (core.file_adapter).
+    file_param_names: set[str] = field(default_factory=set)
+    multi_file_param_names: set[str] = field(default_factory=set)
     # config keys that belong to non-llm params: never overridable by client
     protected_config_keys: set[str] = field(default_factory=set)
     # non-llm parameter names that must not be advertised in the schema
@@ -119,13 +126,21 @@ def _collect_schema_meta(params: list[dict[str, Any]]) -> dict[str, Any]:
     llm_names: set[str] = set()
     server_names: set[str] = set()
     required_server: set[str] = set()
+    file_names: set[str] = set()
+    multi_file_names: set[str] = set()
     for p in params:
         name = p.get("name")
         if not name:
             continue
         if p.get("form", "llm") == "llm":
             llm_names.add(name)
-            types[name] = p.get("type") or "string"
+            ptype = p.get("type") or "string"
+            types[name] = ptype
+            if ptype == "file":
+                file_names.add(name)
+            elif ptype == "files":
+                file_names.add(name)
+                multi_file_names.add(name)
             if p.get("options"):
                 enums[name] = [
                     o.get("value") for o in p["options"] if isinstance(o, dict) and "value" in o
@@ -140,6 +155,8 @@ def _collect_schema_meta(params: list[dict[str, Any]]) -> dict[str, Any]:
         "llm_names": llm_names,
         "server_names": server_names,
         "required_server": required_server,
+        "file_names": file_names,
+        "multi_file_names": multi_file_names,
     }
 
 
@@ -314,6 +331,8 @@ def adapt_tool_entry(
         param_types=meta["types"],
         raw_config=config,
         required_server_params=meta["required_server"],
+        file_param_names=meta["file_names"],
+        multi_file_param_names=meta["multi_file_names"],
         protected_config_keys=protected,
         server_param_names=meta["server_names"],
         unsupported_params=skipped,
@@ -414,13 +433,20 @@ def _resolve_server_values(tool: AdaptedTool, keys: list[str]) -> dict[str, Any]
 
 
 def prepare_invoke_parameters(
-    tool: AdaptedTool, client_args: dict[str, Any]
+    tool: AdaptedTool,
+    client_args: dict[str, Any],
+    *,
+    file_adapter: Any | None = None,
 ) -> dict[str, Any]:
     """Validate client arguments and merge them with server-side config.
 
     - the client may only send ``sendable_param_names`` (llm params the server
       did not pin); anything else -> ToolValidationError
     - missing required params -> ToolValidationError
+    - Dify ``file``/``files`` params are converted to real Dify file
+      parameters through ``file_adapter`` (upload + reference); sending the
+      raw MCP wrapper is never allowed, and a file param without an available
+      adapter is a config error rather than a silent passthrough
     - every server-configured value (pinned llm params + form/schema params)
       is resolved here and always wins; values keep their Dify types, so a
       select ``"false"`` stays the string ``"false"`` (root cause B)
@@ -454,10 +480,22 @@ def prepare_invoke_parameters(
             f"{', '.join(missing)}"
         )
 
-    validated = {
-        name: _coerce_value(name, tool, value)
-        for name, value in client_args.items()
-    }
+    if tool.file_param_names & client_args.keys() and file_adapter is None:
+        raise ToolConfigError(
+            f"tool '{tool.name}' declares file parameters but no file "
+            "upload path is available in this runtime; file parameters "
+            "cannot be forwarded"
+        )
+
+    validated: dict[str, Any] = {}
+    for name, value in client_args.items():
+        if name in tool.file_param_names:
+            if name in tool.multi_file_param_names:
+                validated[name] = file_adapter.resolve_list(value, param_name=name)
+            else:
+                validated[name] = file_adapter.resolve(value, param_name=name)
+        else:
+            validated[name] = _coerce_value(name, tool, value)
 
     # Every server-configured value is resolved and always wins over anything
     # the client sent (defense in depth; client keys are already restricted).
@@ -496,28 +534,213 @@ def prepare_invoke_parameters(
     return merged
 
 
-def format_invoke_result(messages: Any) -> str:
-    """Flatten ToolInvokeMessage stream into one MCP text result."""
+#: Inline cap for image/blob content. A tools/call response is one JSON body,
+#: so a large binary is better delivered as a link than base64-encoded here.
+DEFAULT_INLINE_MAX_BYTES = 3 * 1024 * 1024
 
-    result = ""
+
+def _text_block(text: str) -> dict[str, Any]:
+    return {"type": "text", "text": text}
+
+
+def _image_block(data: bytes, mime: str) -> dict[str, Any]:
+    return {
+        "type": "image",
+        "data": base64.b64encode(data).decode("ascii"),
+        "mimeType": mime,
+    }
+
+
+def _link_note(url: str, name: str, mime: str) -> dict[str, Any]:
+    # `resource_link` exists only from protocol 2025-03-26 on; this server
+    # speaks 2024-11-05, whose content union is text|image|resource (and a
+    # resource requires inline text/blob). A URL is therefore emitted as text.
+    return _text_block(f"{name} ({mime}): {url}")
+
+
+def _blob_of(response: Any) -> bytes:
+    message = getattr(response, "message", None)
+    return bytes(getattr(message, "blob", b"") or b"")
+
+
+def _mime_of(response: Any) -> str | None:
+    meta = getattr(response, "meta", None)
+    if isinstance(meta, dict):
+        for key in ("mime_type", "mimeType"):
+            value = meta.get(key)
+            if isinstance(value, str) and "/" in value:
+                return value
+    return None
+
+
+def guess_mime_from_url(url: str) -> str | None:
+    guessed, _ = mimetypes.guess_type(urlsplit(url).path if "://" in url else url)
+    return guessed
+
+
+def _url_basename(url: str) -> str:
+    tail = urlsplit(url).path.rsplit("/", 1)[-1]
+    return tail or "file"
+
+
+def _inline_binary_blocks(
+    blob: bytes, mime: str, kind: str, inline_max_bytes: int
+) -> list[dict[str, Any]]:
+    """Turn inline bytes into content blocks, or into an honest text note.
+
+    2024-11-05 has no block for arbitrary inline binary: `image` would be a lie
+    for a PDF and `resource` requires a URI the message does not carry. Dify also
+    gives no downloadable URL for inline blobs, so an oversized one is reported
+    rather than truncated.
+    """
+
+    if not blob:
+        return [_text_block(f"[{kind} message carried no data]")]
+    if not mime.startswith("image/"):
+        return [_text_block(
+            f"[tool returned {len(blob)} bytes of {mime}; this protocol "
+            "version has no content block for inline non-image binary]"
+        )]
+    if len(blob) > inline_max_bytes:
+        return [_text_block(
+            f"[{kind} of {len(blob)} bytes ({mime}) exceeds the "
+            f"{inline_max_bytes} byte inline limit and has no downloadable URL]"
+        )]
+    return [_image_block(blob, mime)]
+
+
+def format_invoke_content(
+    messages: Any,
+    *,
+    inline_max_bytes: int = DEFAULT_INLINE_MAX_BYTES,
+) -> list[dict[str, Any]]:
+    """Convert a Dify ToolInvokeMessage stream into MCP content blocks.
+
+    Order is preserved and one message may yield more than one block. Unknown
+    types are logged and degraded to text — never dropped silently, never
+    serialized as a raw Python repr (that produced the old meaningless output).
+    """
+
+    blocks: list[dict[str, Any]] = []
+    # blob_chunk streams: id -> {"chunks": [(seq, bytes)], "mime": str|None}
+    pending: dict[str, dict[str, Any]] = {}
+
     for response in messages:
-        if response.type == ToolInvokeMessage.MessageType.TEXT:
-            result += response.message.text
-        elif response.type == ToolInvokeMessage.MessageType.LINK:
-            result += (
-                f"result link: {response.message.text}."
-                + " please tell user to check it."
+        mtype = response.type
+        if mtype == ToolInvokeMessage.MessageType.TEXT:
+            blocks.append(_text_block(response.message.text))
+
+        elif mtype == ToolInvokeMessage.MessageType.JSON:
+            # Raw JSON, no "tool response:" prefix: clients can parse it.
+            blocks.append(
+                _text_block(
+                    json.dumps(response.message.json_object, ensure_ascii=False, default=str)
+                )
             )
-        elif response.type in {
-            ToolInvokeMessage.MessageType.IMAGE_LINK,
+
+        elif mtype == ToolInvokeMessage.MessageType.LINK:
+            blocks.append(_text_block(f"result link: {response.message.text}"))
+
+        elif mtype == ToolInvokeMessage.MessageType.IMAGE_LINK:
+            url = response.message.text
+            blocks.append(
+                _link_note(url, _url_basename(url), guess_mime_from_url(url) or "image/*")
+            )
+
+        elif mtype in (
             ToolInvokeMessage.MessageType.IMAGE,
-        }:
-            result += "Not support message type: image. "
-        elif response.type == ToolInvokeMessage.MessageType.JSON:
-            text = json.dumps(
-                response.message.json_object, ensure_ascii=False, default=str
+            ToolInvokeMessage.MessageType.BLOB,
+        ):
+            blob = _blob_of(response)
+            default_mime = (
+                "image/png"
+                if mtype == ToolInvokeMessage.MessageType.IMAGE
+                else "application/octet-stream"
             )
-            result += f"tool response: {text}."
+            mime = _mime_of(response) or default_mime
+            blocks.extend(
+                _inline_binary_blocks(blob, mime, mtype.value, inline_max_bytes)
+            )
+
+        elif mtype == ToolInvokeMessage.MessageType.BLOB_CHUNK:
+            chunk = response.message
+            entry = pending.setdefault(
+                chunk.id, {"chunks": [], "mime": _mime_of(response)}
+            )
+            entry["chunks"].append((chunk.sequence, _blob_of(response)))
+            if chunk.end:
+                assembled = sorted(entry["chunks"], key=lambda item: item[0])
+                blob = b"".join(data for _, data in assembled)
+                mime = entry["mime"] or "application/octet-stream"
+                blocks.extend(
+                    _inline_binary_blocks(blob, mime, "BLOB_CHUNK", inline_max_bytes)
+                )
+                pending.pop(chunk.id, None)
+
+        elif mtype == ToolInvokeMessage.MessageType.FILE:
+            meta = response.meta or {}
+            file_ref = meta.get("file") if isinstance(meta, dict) else None
+            url = name = mime = None
+            if isinstance(file_ref, dict):
+                url = file_ref.get("url")
+                name = file_ref.get("filename")
+                mime = file_ref.get("mime_type")
+            if url:
+                blocks.append(_link_note(url, name or _url_basename(url), mime or "application/octet-stream"))
+            else:
+                logger.warning(
+                    "Tool produced a FILE message with no resolvable URL (meta keys=%s)",
+                    sorted(meta.keys()) if isinstance(meta, dict) else type(meta).__name__,
+                )
+                blocks.append(_text_block(
+                    "[tool produced a file that carries no accessible URL]"
+                ))
+
+        elif mtype == ToolInvokeMessage.MessageType.VARIABLE:
+            message = response.message
+            blocks.append(_text_block(
+                f"{message.variable_name}="
+                f"{json.dumps(message.variable_value, ensure_ascii=False, default=str)}"
+            ))
+
+        elif mtype == ToolInvokeMessage.MessageType.RETRIEVER_RESOURCES:
+            message = response.message
+            blocks.append(_text_block(
+                json.dumps(
+                    {
+                        "context": message.context,
+                        "resources": [
+                            r.model_dump(mode="json", exclude_none=True)
+                            for r in message.retriever_resources
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            ))
+
+        elif mtype == ToolInvokeMessage.MessageType.LOG:
+            # Execution telemetry, not a result; surfacing it would also risk
+            # leaking tool internals. Logged, deliberately not returned.
+            logger.debug("Ignoring LOG message from tool")
+
         else:
-            result += f"tool response: {response.message!r}."
-    return result
+            logger.warning("Unhandled tool message type '%s' degraded to text", mtype)
+            blocks.append(_text_block(f"[unsupported tool message type: {mtype}]"))
+
+    for orphan_id, entry in pending.items():
+        logger.warning(
+            "Tool blob stream '%s' ended without a final chunk (%d bytes received)",
+            orphan_id, sum(len(d) for _, d in entry["chunks"]),
+        )
+    if not blocks:
+        blocks.append(_text_block(""))
+    return blocks
+
+
+def format_invoke_result(messages: Any) -> str:
+    """Flatten a message stream to text (kept for callers needing a string)."""
+
+    return "\n".join(
+        block["text"] for block in format_invoke_content(messages)
+        if block["type"] == "text"
+    )

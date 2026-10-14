@@ -8,6 +8,7 @@ schema, and tools/call reaching the (mocked) Dify tool runtime.
 import json
 import types
 
+from fixtures import FakeFileUpload  # noqa: E402
 from endpoints.mcp_post import McpPostEndpoint
 from endpoints.messages import MessageEndpoint
 
@@ -46,7 +47,9 @@ class FakeToolInvocation:
         return [
             ToolInvokeMessage(
                 type=ToolInvokeMessage.MessageType.TEXT,
-                message=ToolInvokeMessage.TextMessage(text=f"results for {parameters['query']}"),
+                message=ToolInvokeMessage.TextMessage(
+                    text=f"results for {parameters.get('query', parameters.get('file'))}"
+                ),
             )
         ]
 
@@ -55,6 +58,9 @@ class FakeSession:
     def __init__(self):
         self.tool = FakeToolInvocation()
         self.storage = FakeStorage()
+        # Mirrors the real session shape: session.file.upload(...)
+        self.file_uploads = FakeFileUpload()
+        self.file = types.SimpleNamespace(upload=self.file_uploads)
 
 
 def _make_request(body: dict):
@@ -151,3 +157,110 @@ def test_sse_message_initialize_via_storage():
     assert resp.status_code == 202
     stored = json.loads(ep.session.storage.get("sess"))
     assert stored["result"]["capabilities"]["tools"] == {"listChanged": False}
+
+
+# --- file input end-to-end (both transports share this path) ---
+
+import base64  # noqa: E402
+
+EXTRACTOR = {
+    "enabled": True,
+    "type": "builtin",
+    "provider_name": "langgenius/dify_extractor/dify_extractor",
+    "tool_name": "dify_extractor",
+    "tool_label": "Extractor",
+    "schemas": [
+        {"name": "file", "type": "file", "form": "llm", "required": True,
+         "llm_description": "file to parse"},
+    ],
+    "settings": {},
+}
+FILE_SETTINGS = {"tools": [EXTRACTOR]}
+PDF_BYTES = b"%PDF-1.4\nbody\n%%EOF"
+
+
+def _file_arguments() -> dict:
+    return {"file": {
+        "source": "base64",
+        "filename": "report.pdf",
+        "mimeType": "application/pdf",
+        "data": base64.b64encode(PDF_BYTES).decode(),
+    }}
+
+
+def test_streamable_file_call_sends_dify_file_dict():
+    ep = _endpoint_with_session(McpPostEndpoint)
+    resp = ep._invoke(
+        _make_request({"id": 6, "method": "tools/call",
+                        "params": {"name": "dify_extractor",
+                                   "arguments": _file_arguments()}}),
+        {}, FILE_SETTINGS,
+    )
+    payload = json.loads(resp.get_data())
+    assert payload["result"]["isError"] is False
+    sent = ep.session.tool.calls[-1]["parameters"]["file"]
+    assert sent["dify_model_identity"] == "__dify__file__"
+    assert sent["type"] == "document"
+    assert sent["mime_type"] == "application/pdf"
+    assert sent["size"] == len(PDF_BYTES)
+    assert sent["url"].startswith("https://files.invalid/files/tools/")
+    # the MCP wrapper never leaks downstream
+    assert "source" not in sent and "data" not in sent
+    # and it really did go through the Dify upload path
+    assert ep.session.file_uploads.calls == [
+        {"filename": "report.pdf", "bytes": len(PDF_BYTES), "mime": "application/pdf"}
+    ]
+
+
+def test_sse_file_call_uses_same_conversion():
+    ep = _endpoint_with_session(MessageEndpoint)
+    req = types.SimpleNamespace(
+        json={"id": 7, "method": "tools/call",
+              "params": {"name": "dify_extractor", "arguments": _file_arguments()}},
+        args={"session_id": "f1"})
+    ep._invoke(req, {}, FILE_SETTINGS)
+    sent = ep.session.tool.calls[-1]["parameters"]["file"]
+    assert sent["dify_model_identity"] == "__dify__file__"
+    assert len(ep.session.file_uploads.calls) == 1
+
+
+def test_missing_required_file_is_a_tool_error():
+    ep = _endpoint_with_session(McpPostEndpoint)
+    resp = ep._invoke(
+        _make_request({"id": 8, "method": "tools/call",
+                        "params": {"name": "dify_extractor", "arguments": {}}}),
+        {}, FILE_SETTINGS,
+    )
+    payload = json.loads(resp.get_data())
+    assert payload["result"]["isError"] is True
+    assert "missing required parameter" in payload["result"]["content"][0]["text"]
+    assert ep.session.file_uploads.calls == []
+
+
+def test_client_cannot_override_server_pinned_file():
+    settings = {"tools": [{**EXTRACTOR, "settings": {
+        "file": {"type": "constant", "value": "pinned-by-admin"}}}]}
+    ep = _endpoint_with_session(McpPostEndpoint)
+    resp = ep._invoke(
+        _make_request({"id": 9, "method": "tools/call",
+                        "params": {"name": "dify_extractor",
+                                   "arguments": _file_arguments()}}),
+        {}, settings,
+    )
+    payload = json.loads(resp.get_data())
+    assert payload["result"]["isError"] is True
+    assert "fixed server-side configuration" in payload["result"]["content"][0]["text"]
+    assert ep.session.file_uploads.calls == []
+
+
+def test_bad_file_input_is_tool_error_not_crash():
+    ep = _endpoint_with_session(McpPostEndpoint)
+    bad = {"file": {"source": "base64", "filename": "x.pdf", "data": "not base64!"}}
+    resp = ep._invoke(
+        _make_request({"id": 10, "method": "tools/call",
+                        "params": {"name": "dify_extractor", "arguments": bad}}),
+        {}, FILE_SETTINGS,
+    )
+    payload = json.loads(resp.get_data())
+    assert payload["result"]["isError"] is True
+    assert "invalid base64" in payload["result"]["content"][0]["text"]

@@ -219,6 +219,36 @@ def form_mixed_tool(project_id_value, *, required=False, raw_settings=None):
     }
 
 
+class FakeUploadedFile:
+    """Stand-in for dify_plugin UploadFileResponse."""
+
+    def __init__(self, filename: str, content: bytes, mimetype: str, seq: int):
+        self.id = f"tool-file-{seq}"
+        self.name = filename
+        self.size = len(content)
+        self.extension = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
+        self.mime_type = mimetype
+        self.type = "document"
+        self.preview_url = (
+            f"https://files.invalid/files/tools/{self.id}{self.extension}"
+            "?timestamp=1&nonce=n&sign=s"
+        )
+
+
+class FakeFileUpload:
+    """Stand-in for ``session.file.upload`` capturing uploads."""
+
+    def __init__(self, error: Exception | None = None):
+        self.calls = []
+        self._error = error
+
+    def __call__(self, filename, content, mimetype):
+        self.calls.append({"filename": filename, "bytes": len(content), "mime": mimetype})
+        if self._error is not None:
+            raise self._error
+        return FakeUploadedFile(filename, content, mimetype, len(self.calls))
+
+
 class FakeToolInvocation:
     """Stand-in for ``self.session.tool.invoke`` capturing sent parameters."""
 

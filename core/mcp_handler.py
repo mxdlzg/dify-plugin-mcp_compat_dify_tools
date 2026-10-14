@@ -14,12 +14,13 @@ from typing import Any
 
 from dify_plugin.entities.tool import ToolInvokeMessage
 
+from core.file_adapter import FileAdapter, FileAdapterError, FileLimits
 from core.tool_adapter import (
     AdaptedTool,
     ToolConfigError,
     ToolValidationError,
     adapt_tools,
-    format_invoke_result,
+    format_invoke_content,
     prepare_invoke_parameters,
     to_mcp_tool,
 )
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 
 # (tool, validated-parameters) -> ToolInvokeMessage stream
 InvokeTool = Callable[[AdaptedTool, dict[str, Any]], Iterable[ToolInvokeMessage]]
+
+# upload(filename, content, mimetype) -> UploadFileResponse-like object.
+# Injected by the endpoints (``self.session.file.upload``) so the handler and
+# the file adapter stay testable without a live session.
+UploadFile = Callable[[str, bytes, str], Any]
 
 
 def rpc_result(req_id: Any, result: dict[str, Any]) -> dict[str, Any]:
@@ -46,17 +52,22 @@ def _tool_call_result(message: str, *, is_error: bool) -> dict[str, Any]:
     }
 
 
+def _tool_call_blocks(content: list[dict[str, Any]], *, is_error: bool) -> dict[str, Any]:
+    return {"content": content, "isError": is_error}
+
+
 def dispatch(
     method: Any,
     req_id: Any,
     params: dict[str, Any],
     settings: Mapping,
     invoke_tool: InvokeTool,
+    upload_file: UploadFile | None = None,
 ) -> dict[str, Any]:
     if method == "tools/list":
         return _tools_list(req_id, settings)
     if method == "tools/call":
-        return _tools_call(req_id, params, settings, invoke_tool)
+        return _tools_call(req_id, params, settings, invoke_tool, upload_file)
     return rpc_error(req_id, -32601, f"Unsupported method: {method}")
 
 
@@ -76,6 +87,7 @@ def _tools_call(
     params: dict[str, Any],
     settings: Mapping,
     invoke_tool: InvokeTool,
+    upload_file: UploadFile | None = None,
 ) -> dict[str, Any]:
     tool_name = params.get("name")
     arguments = params.get("arguments") or {}
@@ -87,14 +99,18 @@ def _tools_call(
         # isError=true, not a JSON-RPC protocol error.
         return rpc_result(req_id, _tool_call_result(f"Unknown tool: {tool_name}", is_error=True))
 
+    # Built per call so the total-bytes budget bounds one request, and the
+    # upload-reuse cache cannot outlive the signed URL's validity.
+    file_adapter = FileAdapter(upload_file, FileLimits.from_settings(settings)) if upload_file else None
+
     try:
-        prepared = prepare_invoke_parameters(tool, arguments)
-    except (ToolValidationError, ToolConfigError) as exc:
+        prepared = prepare_invoke_parameters(tool, arguments, file_adapter=file_adapter)
+    except (ToolValidationError, ToolConfigError, FileAdapterError) as exc:
         return rpc_result(req_id, _tool_call_result(str(exc), is_error=True))
 
     try:
         messages = invoke_tool(tool, prepared)
-        text = format_invoke_result(messages)
+        content = format_invoke_content(messages)
     except Exception:
         # Keep the full traceback server-side; the Dify tool runtime may
         # include provider details that must not travel back to the client.
@@ -104,4 +120,12 @@ def _tools_call(
             _tool_call_result(f"Tool '{tool_name}' failed during execution", is_error=True),
         )
 
-    return rpc_result(req_id, _tool_call_result(text, is_error=False))
+    # Text-only clients ignore image blocks; if the tool returned nothing
+    # textual, add a description so the result is not silently empty for them.
+    if not any(b["type"] == "text" for b in content):
+        summary = ", ".join(
+            f"{b['type']} ({b.get('mimeType', 'unknown')})" for b in content
+        )
+        content = content + [{"type": "text", "text": f"[returned {len(content)} non-text block(s): {summary}]"}]
+
+    return rpc_result(req_id, _tool_call_blocks(content, is_error=False))

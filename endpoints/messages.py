@@ -53,6 +53,7 @@ class MessageEndpoint(Endpoint):
                 data.get("params") or {},
                 resolve_settings(settings, self.session.storage),
                 self._invoke_tool,
+                self.session.file.upload,
             )
 
         if session_id:
